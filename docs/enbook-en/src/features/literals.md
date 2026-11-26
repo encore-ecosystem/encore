@@ -8,6 +8,18 @@ otherwise the expected type drives inference.
 {{#include ../../examples/guide/src/features/mod.enq:literals}}
 ```
 
+## Digit separators
+
+Use a single underscore between digits to make a numeric literal easier to
+read. Grouping can be uneven, and a type suffix can follow the final digit.
+
+```encore
+let million = 1_000_000
+let count = 1_00_000_u32
+let mask = 0xDEAD_BEEF_u32
+let price = 1_000.0_125_f64
+```
+
 ## Radix and expected type
 
 The radix changes the spelling of a number, not its type. These are fragments

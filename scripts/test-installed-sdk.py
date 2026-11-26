@@ -25,7 +25,7 @@ def verify(archive: Path, release: str, triple: str, scratch: Path) -> None:
     project = scratch / "application"
     (project / "src").mkdir(parents=True)
     sdk = installation / "lib/encore/index"
-    dependencies = [f"path@{(sdk / name).as_posix()}" for name in ("std", "json")]
+    dependencies = ["sys@std", f"path@{(sdk / 'json').as_posix()}"]
     (project / "encore.toml").write_text(
         '[project]\nname="installed_sdk_probe"\nversion="0.0.0"\ndependencies='
         + json.dumps(dependencies) + '\n', encoding="utf-8")
@@ -50,6 +50,18 @@ fn main() -> u32 {
                                 env=env, capture_output=True, text=True, timeout=600)
         if result.returncode != 0 or "installed-sdk-ok" not in result.stdout:
             raise AssertionError(f"installed SDK failed ({result.returncode})\n{result.stdout}\n{result.stderr}")
+    runtime = scratch / "runtime"
+    (runtime / "src").mkdir(parents=True)
+    fixture = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "asyncio" / "src" / "main.enq"
+    (runtime / "src/main.enq").write_bytes(fixture.read_bytes())
+    (runtime / "encore.toml").write_text(
+        '[project]\nname="installed_asyncio_probe"\nversion="0.0.0"\n'
+        'dependencies=["sys@asyncio", "sys@ipc"]\n', encoding="utf-8"
+    )
+    result = subprocess.run([str(compiler), "run", "--jobs", "2"], cwd=runtime,
+                            env=env, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise AssertionError(f"installed asyncio failed ({result.returncode})\n{result.stdout}\n{result.stderr}")
     print("extracted release SDK: cold and warm offline application verified", flush=True)
 
 

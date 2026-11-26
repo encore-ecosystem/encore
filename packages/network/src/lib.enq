@@ -1,0 +1,517 @@
+//! Handle-based TCP/TLS with one nonblocking reactor and bounded DNS workers.
+import core::future::{Context, Future, Poll}
+import core::ops::ContextManager
+import core::result::Result
+
+import std::future::block_on
+
+extern fn mfnet_endpoint_operation(kind: i32, host: str, port: usize, tls: bool, ca: str, cert: str, key: str, timeout: usize) -> usize
+extern fn mfnet_local_operation(kind: i32, path: str, timeout: usize) -> usize
+extern fn mfnet_io_operation(kind: i32, handle: usize, bytes: str, max: usize, timeout: usize) -> usize
+extern fn mfnet_status(id: usize, waker: usize) -> i32
+extern fn mfnet_data(id: usize) -> str
+extern fn mfnet_error(id: usize) -> str
+extern fn mfnet_result_handle(id: usize) -> usize
+extern fn mfnet_release(id: usize)
+extern fn mfnet_operation_group(id: usize, group: usize)
+extern fn mfnet_cancel(id: usize)
+extern fn mfnet_close(id: usize)
+extern fn mfnet_port(id: usize) -> usize
+extern fn mfnet_random(length: usize) -> str
+
+pub enum ErrorKind {
+    Closed
+    Cancelled
+    Timeout
+    Dns
+    Connect
+    Tls
+    Capacity
+}
+pub struct NetworkError {
+    kind: ErrorKind
+    message: str
+}
+pub struct ConnectOptions {
+    host: str
+    port: usize
+    tls: bool
+    ca_file: str
+    timeout_ms: usize
+}
+pub struct ListenOptions {
+    host: str
+    port: usize
+    certificate: str
+    private_key: str
+    timeout_ms: usize
+}
+pub struct Stream {
+    handle: usize
+    timeout_ms: usize
+}
+pub struct Listener {
+    handle: usize
+    timeout_ms: usize
+}
+pub struct OperationResult {
+    handle: usize
+    data: str
+}
+
+/// Lazy single-consumer future. close() cancels all operations on a stream;
+/// cancel() cancels this operation. Completed futures release native storage.
+pub struct OperationFuture {
+    kind: i32
+    endpoint: usize
+    bytes: str
+    size: usize
+    timeout_ms: usize
+    host: str
+    port: usize
+    tls: bool
+    ca: str
+    cert: str
+    key: str
+    operation: usize
+    group: usize
+}
+
+impl for OperationFuture {
+    pub fn io(kind: i32, endpoint: usize, bytes: str, size: usize, timeout_ms: usize) -> Self {
+        ret Self {
+            kind, endpoint, bytes, size, timeout_ms, "", 0_usize, false, "", "", "", 0_usize, 0_usize
+        }
+    }
+    pub fn endpoint(kind: i32, host: str, port: usize, tls: bool, ca: str, cert: str, key: str, timeout_ms: usize) -> Self {
+        ret Self {
+            kind, 0_usize, "", 0_usize, timeout_ms, host, port, tls, ca, cert, key, 0_usize, 0_usize
+        }
+    }
+    /// Associate the operation and resulting stream with a Mailbox lifetime.
+    pub fn in_group(self: Self, group: usize) -> Self {
+        ret Self {
+            self.kind, self.endpoint, self.bytes, self.size, self.timeout_ms, self.host, self.port, self.tls, self.ca, self.cert, self.key, self.operation, group
+        }
+    }
+    #attr(safe)
+    pub fn cancel(self: Self) ->() {
+        unsafe {
+            if self.operation != 0_usize {
+                mfnet_cancel(self.operation)
+            }
+        }
+    }
+}
+
+impl Future[Result[OperationResult, NetworkError]] for OperationFuture {
+    #attr(safe)
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[OperationResult, NetworkError]] {
+        unsafe {
+            let mut state = self
+            if state.operation == 0_usize {
+                if state.kind == 1_i32 || state.kind == 7_i32 {
+                    state.operation = mfnet_endpoint_operation(state.kind, state.host, state.port, state.tls, state.ca, state.cert, state.key, state.timeout_ms)
+                } elif state.kind == 9_i32 || state.kind == 10_i32 {
+                    state.operation = mfnet_local_operation(state.kind, state.host, state.timeout_ms)
+                } else {
+                    state.operation = mfnet_io_operation(state.kind, state.endpoint, state.bytes, state.size, state.timeout_ms)
+                }
+            }
+            if state.operation == 0_usize {
+                ret Poll::Ready(Result::Err(NetworkError {
+                            ErrorKind::Capacity, "invalid configuration, concurrent operation, or network capacity exhausted"
+                        }
+                    ))
+            }
+            if state.group != 0_usize {
+                mfnet_operation_group(state.operation, state.group)
+            }
+            let status = mfnet_status(state.operation, context.waker.token)
+            if status == 0_i32 {
+                ret Poll::Pending(state)
+            }
+            if status == 1_i32 {
+                let value = OperationResult {
+                    mfnet_result_handle(state.operation), mfnet_data(state.operation)
+                }
+                mfnet_release(state.operation)
+                ret Poll::Ready(Result::Ok(value))
+            }
+            let message = mfnet_error(state.operation)
+            mfnet_release(state.operation)
+            let kind = match status {
+                2_i32 => ErrorKind::Closed 3_i32 => ErrorKind::Cancelled 4_i32 => ErrorKind::Timeout 5_i32 => ErrorKind::Dns 6_i32 => ErrorKind::Connect 7_i32 => ErrorKind::Tls _ => ErrorKind::Capacity
+            }
+            ret Poll::Ready(Result::Err(NetworkError { kind, message }))
+        }
+    }
+}
+
+impl for ConnectOptions {
+    pub fn tcp(host: str, port: usize) -> Self {
+        ret Self { host, port, false, "", 30000_usize }
+    }
+    pub fn tls(host: str, port: usize) -> Self {
+        ret Self { host, port, true, "", 30000_usize }
+    }
+}
+
+impl for ListenOptions {
+    pub fn tcp(host: str, port: usize) -> Self {
+        ret Self { host, port, "", "", 30000_usize }
+    }
+    pub fn tls(host: str, port: usize, certificate: str, private_key: str) -> Self {
+        ret Self {
+            host, port, certificate, private_key, 30000_usize
+        }
+    }
+}
+
+impl for Stream {
+    pub fn local_connect_async(path: str, timeout_ms: usize) -> NetworkConnectFuture {
+        ret NetworkConnectFuture {
+            OperationFuture::endpoint(9_i32, path, 0_usize, false, "", "", "", timeout_ms),
+            timeout_ms
+        }
+    }
+    pub fn local_shutdown_write_async(self: Self) -> NetworkWriteFuture {
+        ret NetworkWriteFuture {
+            OperationFuture::io(11_i32, self.handle, "", 0_usize, self.timeout_ms), false
+        }
+    }
+    pub fn connect_async(options: ConnectOptions) -> NetworkConnectFuture {
+        ret NetworkConnectFuture {
+            OperationFuture::endpoint(1_i32, options.host, options.port, options.tls, options.ca_file, "", "", options.timeout_ms), options.timeout_ms
+        }
+    }
+    pub fn connect(options: ConnectOptions) -> Result[Self, NetworkError] {
+        let value = block_on[Result[OperationResult, NetworkError], OperationFuture](OperationFuture::endpoint(1_i32, options.host, options.port, options.tls, options.ca_file, "", "", options.timeout_ms))?
+        ret Result::Ok(Self { value.handle, options.timeout_ms })
+    }
+    pub fn read_async(self: Self, max: usize) -> NetworkReadFuture {
+        ret NetworkReadFuture {
+            OperationFuture::io(2_i32, self.handle, "", max, self.timeout_ms)
+        }
+    }
+    pub fn read(self: Self, max: usize) -> Result[str, NetworkError] {
+        let value = block_on[Result[OperationResult, NetworkError], OperationFuture](OperationFuture::io(2_i32, self.handle, "", max, self.timeout_ms))?
+        ret Result::Ok(value.data)
+    }
+    pub fn write_all_async(self: Self, bytes: str) -> NetworkWriteFuture {
+        ret NetworkWriteFuture {
+            OperationFuture::io(3_i32, self.handle, bytes, 0_usize, self.timeout_ms), false
+        }
+    }
+    pub fn write_all(self: Self, bytes: str) -> Result[(), NetworkError] {
+        let _value = block_on[Result[OperationResult, NetworkError], OperationFuture](OperationFuture::io(3_i32, self.handle, bytes, 0_usize, self.timeout_ms))?
+        ret Result::Ok(())
+    }
+    #attr(safe)
+    pub fn close(self: Self) ->() {
+        unsafe {
+            mfnet_close(self.handle)
+        }
+    }
+}
+
+impl for Listener {
+    pub fn local_bind_async(path: str, timeout_ms: usize) -> NetworkListenFuture {
+        ret NetworkListenFuture {
+            OperationFuture::endpoint(10_i32, path, 0_usize, false, "", "", "", timeout_ms),
+            timeout_ms
+        }
+    }
+    pub fn bind_async(options: ListenOptions) -> NetworkListenFuture {
+        ret NetworkListenFuture {
+            OperationFuture::endpoint(7_i32, options.host, options.port, options.certificate != "", "", options.certificate, options.private_key, options.timeout_ms), options.timeout_ms
+        }
+    }
+    pub fn bind(options: ListenOptions) -> Result[Self, NetworkError] {
+        let value = block_on[Result[OperationResult, NetworkError], OperationFuture](OperationFuture::endpoint(7_i32, options.host, options.port, options.certificate != "", "", options.certificate, options.private_key, options.timeout_ms))?
+        ret Result::Ok(Self { value.handle, options.timeout_ms })
+    }
+    pub fn accept_async(self: Self) -> NetworkConnectFuture {
+        ret NetworkConnectFuture {
+            OperationFuture::io(4_i32, self.handle, "", 0_usize, self.timeout_ms), self.timeout_ms
+        }
+    }
+    pub fn accept(self: Self) -> Result[Stream, NetworkError] {
+        let value = block_on[Result[OperationResult, NetworkError], OperationFuture](OperationFuture::io(4_i32, self.handle, "", 0_usize, self.timeout_ms))?
+        ret Result::Ok(Stream { value.handle, self.timeout_ms })
+    }
+    #attr(safe)
+    pub fn local_port(self: Self) -> usize {
+        unsafe {
+            ret mfnet_port(self.handle)
+        }
+    }
+    #attr(safe)
+    pub fn close(self: Self) ->() {
+        unsafe {
+            mfnet_close(self.handle)
+        }
+    }
+}
+
+impl ContextManager for Stream {
+    pub fn with_enter(self: Self) -> Self {
+        ret self
+    }
+    pub fn with_exit(self: Self) -> bool {
+        self.close() ret true
+    }
+}
+
+impl ContextManager for Listener {
+    pub fn with_enter(self: Self) -> Self {
+        ret self
+    }
+    pub fn with_exit(self: Self) -> bool {
+        self.close() ret true
+    }
+}
+pub fn sleep_async(milliseconds: usize) -> NetworkWriteFuture {
+    ret NetworkWriteFuture {
+        OperationFuture::io(5_i32, 0_usize, "", 0_usize, if milliseconds == 0_usize {
+                1_usize
+            } else {
+                milliseconds
+            }
+            ,
+        ), milliseconds == 0_usize
+    }
+}
+#attr(safe)
+pub fn random_bytes(length: usize) -> Result[str, NetworkError] {
+    unsafe {
+        let bytes = mfnet_random(length)
+        if bytes.byte_len() != length {
+            ret Result::Err(NetworkError {
+                    ErrorKind::Tls, "system entropy unavailable"
+                }
+            )
+        }
+        ret Result::Ok(bytes)
+    }
+}
+extern fn mfnet_byte(value: u8) -> str
+extern fn mfnet_xor(bytes: str, key: str) -> str
+/// Constructs one raw byte, without Unicode encoding.
+#attr(safe)
+pub fn byte(value: u8) -> str {
+    unsafe {
+        ret mfnet_byte(value)
+    }
+}
+/// XORs a byte string with a repeating nonempty key.
+#attr(safe)
+pub fn xor_bytes(bytes: str, key: str) -> str {
+    unsafe {
+        ret mfnet_xor(bytes, key)
+    }
+}
+
+extern fn mfnet_state_get(id: usize, slot: usize) -> str
+extern fn mfnet_state_set(id: usize, slot: usize, value: str) -> bool
+extern fn mfnet_flag_get(id: usize, slot: usize) -> usize
+extern fn mfnet_flag_set(id: usize, slot: usize, value: usize)
+
+impl for Stream {
+    #attr(safe)
+    pub fn state_get(self: Self, slot: usize) -> str {
+        unsafe {
+            ret mfnet_state_get(self.handle, slot)
+        }
+    }
+    #attr(safe)
+    pub fn state_set(self: Self, slot: usize, value: str) -> bool {
+        unsafe {
+            ret mfnet_state_set(self.handle, slot, value)
+        }
+    }
+    #attr(safe)
+    pub fn flag_get(self: Self, slot: usize) -> usize {
+        unsafe {
+            ret mfnet_flag_get(self.handle, slot)
+        }
+    }
+    #attr(safe)
+    pub fn flag_set(self: Self, slot: usize, value: usize) ->() {
+        unsafe {
+            mfnet_flag_set(self.handle, slot, value)
+        }
+    }
+}
+
+extern fn mfnet_mailbox_new(capacity: usize) -> usize
+extern fn mfnet_mailbox_push(id: usize, bytes: str) -> bool
+extern fn mfnet_mailbox_finish(id: usize)
+extern fn mfnet_flag_increment(id: usize, slot: usize) -> usize
+extern fn mfnet_state_cas(id: usize, slot: usize, expected: str, next: str) -> bool
+/// Bounded native byte mailbox. finish() drains queued values; close() cancels.
+pub struct Mailbox {
+    handle: usize
+}
+
+impl for Mailbox {
+    #attr(safe)
+    pub fn new(capacity: usize) -> Result[Self, NetworkError] {
+        unsafe {
+            let handle = mfnet_mailbox_new(capacity) if handle == 0_usize {
+                ret Result::Err(NetworkError {
+                        ErrorKind::Capacity, "cannot allocate mailbox"
+                    }
+                )
+            }
+            ret Result::Ok(Self {
+                    handle
+                }
+            )
+        }
+    }
+    #attr(safe)
+    pub fn push(self: Self, bytes: str) -> bool {
+        unsafe {
+            ret mfnet_mailbox_push(self.handle, bytes)
+        }
+    }
+    pub fn pop_async(self: Self, timeout_ms: usize) -> OperationFuture {
+        ret OperationFuture::io(8_i32, self.handle, "", 0_usize, timeout_ms)
+    }
+    pub fn pop(self: Self, timeout_ms: usize) -> Result[str, NetworkError] {
+        let value = block_on[Result[OperationResult, NetworkError], OperationFuture](self.pop_async(timeout_ms))? ret Result::Ok(value.data)
+    }
+    #attr(safe)
+    pub fn finish(self: Self) ->() {
+        unsafe {
+            mfnet_mailbox_finish(self.handle)
+        }
+    }
+    pub fn state(self: Self) -> Stream {
+        ret Stream { self.handle, 30000_usize }
+    }
+    pub fn close(self: Self) ->() {
+        self.state().close()
+    }
+}
+
+impl for Stream {
+    #attr(safe)
+    pub fn flag_increment(self: Self, slot: usize) -> usize {
+        unsafe {
+            ret mfnet_flag_increment(self.handle, slot)
+        }
+    }
+    #attr(safe)
+    pub fn state_compare_exchange(self: Self, slot: usize, expected: str, next: str) -> bool {
+        unsafe {
+            ret mfnet_state_cas(self.handle, slot, expected, next)
+        }
+    }
+}
+
+pub struct NetworkConnectFuture {
+    operation: OperationFuture
+    timeout_ms: usize
+}
+pub struct NetworkListenFuture {
+    operation: OperationFuture
+    timeout_ms: usize
+}
+pub struct NetworkReadFuture {
+    operation: OperationFuture
+}
+pub struct NetworkWriteFuture {
+    operation: OperationFuture
+    immediate: bool
+}
+
+impl Future[Result[Stream, NetworkError]] for NetworkConnectFuture {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[Stream, NetworkError]] {
+        match self.operation.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next, self.timeout_ms })
+            }
+            Poll::Ready(result) => {
+                match result {
+                    Result::Ok(value) => {
+                        ret Poll::Ready(Result::Ok(Stream {
+                                    value.handle, self.timeout_ms
+                                }
+                            ))
+                    }
+                    Result::Err(failure) => {
+                        ret Poll::Ready(Result::Err(failure))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Future[Result[Listener, NetworkError]] for NetworkListenFuture {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[Listener, NetworkError]] {
+        match self.operation.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next, self.timeout_ms })
+            }
+            Poll::Ready(result) => {
+                match result {
+                    Result::Ok(value) => {
+                        ret Poll::Ready(Result::Ok(Listener {
+                                    value.handle, self.timeout_ms
+                                }
+                            ))
+                    }
+                    Result::Err(failure) => {
+                        ret Poll::Ready(Result::Err(failure))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Future[Result[str, NetworkError]] for NetworkReadFuture {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[str, NetworkError]] {
+        match self.operation.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next })
+            }
+            Poll::Ready(result) => {
+                match result {
+                    Result::Ok(value) => {
+                        ret Poll::Ready(Result::Ok(value.data))
+                    }
+                    Result::Err(failure) => {
+                        ret Poll::Ready(Result::Err(failure))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Future[Result[(), NetworkError]] for NetworkWriteFuture {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[(), NetworkError]] {
+        if self.immediate {
+            ret Poll::Ready(Result::Ok(()))
+        }
+        match self.operation.poll(context) {
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next, false })
+            }
+            Poll::Ready(result) => {
+                match result {
+                    Result::Ok(_) => {
+                        ret Poll::Ready(Result::Ok(()))
+                    }
+                    Result::Err(failure) => {
+                        ret Poll::Ready(Result::Err(failure))
+                    }
+                }
+            }
+        }
+    }
+}

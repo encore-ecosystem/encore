@@ -1,0 +1,423 @@
+//! A bounded work queue and a pool of threads driving Encore futures.
+import core::future::{Context, Future, Poll, context}
+import core::option::Option
+import core::result::Result
+import core::vec::Vec
+
+import std::future::{CancellationFuture, CancellationOutcome, block_on, cancellable}
+import std::sync::{AtomicU64, CancellationToken, Frozen, ReceiveFuture, Receiver, Sender, bounded, into_receiver}
+import std::thread::{JoinHandle, available_parallelism}
+
+pub import network::sleep_async as sleep
+import platform::sync::{__Lease, __adopt, __payload_drop, __payload_drop_address, __payload_new, __payload_take, __payload_take_local, encore_sync_box_new, encore_sync_box_take}
+
+extern fn encore_asyncio_poll(callback: usize, payload: usize, waker: usize) -> usize
+extern fn encore_asyncio_drop(callback: usize, payload: usize) ->()
+extern fn encore_async_waker_new() -> usize
+extern fn encore_async_waker_child(parent: usize) -> usize
+extern fn encore_async_waker_wait(waker: usize) ->()
+extern fn encore_async_waker_drop(waker: usize) ->()
+extern fn encore_asyncio_current() -> usize
+extern fn encore_asyncio_set_current(payload: usize) -> usize
+
+pub enum SpawnError {
+    ClosedOrFull
+    InvalidCapacity
+}
+
+pub enum JoinError {
+    Cancelled
+    WorkerClosed
+}
+
+struct Completion {
+    result: __Lease
+}
+
+pub struct TaskHandle[T] {
+    result: ReceiveFuture[Completion]
+    cancellation: CancellationToken
+}
+
+impl[T] for TaskHandle[T] {
+    #attr(borrowed_self)
+    pub fn cancel(self: Self) ->() {
+        self.cancellation.cancel()
+    }
+}
+
+impl[T] Future[Result[T, JoinError]] for TaskHandle[T] {
+    #attr(reflection_template)
+    pub fn poll(self: Self, cx: Context) -> Poll[Self, Result[T, JoinError]] {
+        match self.result.poll(cx) {
+            Poll::Ready(result) => {
+                match result {
+                    Result::Ok(completion) => {
+                        if completion.result.raw() == 0_usize {
+                            ret Poll::Ready(Result::Err(JoinError::Cancelled))
+                        }
+                        let payload = encore_sync_box_take(completion.result.raw())
+                        if payload == 0_usize {
+                            ret Poll::Ready(Result::Err(JoinError::WorkerClosed))
+                        }
+                        ret Poll::Ready(Result::Ok(__payload_take[T](payload)))
+                    }
+                    Result::Err(_) => {
+                        ret Poll::Ready(Result::Err(JoinError::WorkerClosed))
+                    }
+                }
+            }
+            Poll::Pending(next) => {
+                ret Poll::Pending(Self { next, self.cancellation })
+            }
+        }
+    }
+}
+
+struct Task[T, F] {
+    future: CancellationFuture[F, T]
+    output: Sender[Completion]
+    handle: Handle
+    cancellation: CancellationToken
+}
+
+struct Job {
+    payload: usize
+    poller: usize
+    dropper: usize
+    waker: usize
+}
+
+// The compiler supplies the address of the concrete typed adapter.
+pub fn __poll_address[T, F: Future[T]]() -> usize {
+    ret 0_usize
+}
+
+// Only the worker which owns this payload may invoke the adapter.
+#attr(reflection_template)
+pub fn __poll_payload[T, F: Future[T]](payload: usize, waker: usize) -> usize {
+    let task = __payload_take_local[Task[T, F]](payload)
+    if task.cancellation.is_cancelled() {
+        task.output.try_send(Completion { __adopt(0_usize) })
+        ret 0_usize
+    }
+    let previous = encore_asyncio_set_current(__payload_new[Handle](task.handle))
+    let polled = task.future.poll(context(waker))
+    restore_current(previous)
+    match polled {
+        Poll::Pending(next) => {
+            ret __payload_new[Task[T, F]](Task[T, F] {
+                    next, task.output, task.handle, task.cancellation
+                }
+            )
+        }
+        Poll::Ready(outcome) => {
+            match outcome {
+                CancellationOutcome::Ready(value) => {
+                    complete[T](task.output, value)
+                }
+                CancellationOutcome::Cancelled(_) => {
+                    task.output.try_send(Completion { __adopt(0_usize) })
+                }
+            }
+            ret 0_usize
+        }
+    }
+}
+
+#attr(reflection_template)
+fn complete[T](output: Sender[Completion], value: sending T) ->() {
+    let payload = __payload_new[T](value)
+    let boxed = encore_sync_box_new(payload, __payload_drop_address[T]())
+    if boxed == 0_usize {
+        __payload_drop[T](payload)
+        ret()
+    }
+    output.try_send(Completion { __adopt(boxed) })
+}
+
+#attr(safe)
+fn poll_job(job: Job, waker: usize) -> usize {
+    unsafe {
+        ret encore_asyncio_poll(job.poller, job.payload, waker)
+    }
+}
+
+#attr(safe)
+fn free_job(job: Job) ->() {
+    unsafe {
+        encore_asyncio_drop(job.dropper, job.payload)
+    }
+}
+
+struct Worker {
+    jobs: Vec[Job]
+    queue: Receiver[Job]
+    next: Option[ReceiveFuture[Job]]
+    capacity: usize
+}
+
+impl Future[u32] for Worker {
+    fn poll(self: Self, cx: Context) -> Poll[Self, u32] {
+        let mut worker = self
+        let mut received = 0_usize
+        while received < 32_usize && worker.jobs.len() < worker.capacity {
+            match worker.next {
+                Some(pending) => {
+                    match pending.poll(cx) {
+                        Poll::Ready(result) => {
+                            match result {
+                                Result::Ok(job) => {
+                                    let waker = encore_async_waker_child(cx.waker.raw_token())
+                                    if waker == 0_usize {
+                                        free_job(job)
+                                    } else {
+                                        worker.jobs.push(Job {
+                                                job.payload, job.poller, job.dropper, waker
+                                            }
+                                        )
+                                    }
+                                    worker.next = Option[ReceiveFuture[Job]]::Some(worker.queue.receive())
+                                    received += 1_usize
+                                }
+                                Result::Err(_) => {
+                                    worker.next = Option[ReceiveFuture[Job]]::None break
+                                }
+                            }
+                        }
+                        Poll::Pending(next) => {
+                            worker.next = Option[ReceiveFuture[Job]]::Some(next) break
+                        }
+                    }
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        // Keep pending work on its assigned worker and poll other tasks while it waits.
+        let mut pending_jobs = Vec[Job]::new()
+        for job in worker.jobs {
+            let next = poll_job(job, job.waker)
+            if next != 0_usize {
+                pending_jobs.push(Job { next, job.poller, job.dropper, job.waker })
+            } else {
+                encore_async_waker_drop(job.waker)
+            }
+        }
+        let made_room = worker.jobs.len() == worker.capacity && pending_jobs.len() < worker.capacity
+        worker.jobs = pending_jobs
+        if worker.next.is_none() && worker.jobs.is_empty() {
+            ret Poll::Ready(0_u32)
+        }
+        if received == 32_usize || made_room {
+            cx.waker.wake()
+        }
+        ret Poll::Pending(worker)
+    }
+}
+
+fn worker_main(queue: sending Receiver[Job], capacity: usize) -> u32 {
+    ret block_on[u32, Worker](Worker {
+            Vec[Job]::new(), queue, Option::Some(queue.receive()), capacity
+        }
+    )
+}
+
+struct Pool {
+    queues: Frozen[Vec[Sender[Job]]]
+    next: AtomicU64
+}
+
+impl for Pool {
+    pub fn send(self: Self, job: Job) -> bool {
+        let queues = self.queues.get()
+        let count = queues.len()
+        let start =(self.next.fetch_add(1_u64) %(count as u64)) as usize
+        for offset in 0_usize..count {
+            match queues.get((start + offset) % count) {
+                Option::Some(queue) => {
+                    if queue.try_send(job).is_ok() {
+                        ret true
+                    }
+                }
+                Option::None => {
+                }
+            }
+        }
+        ret false
+    }
+    pub fn close(self: Self) ->() {
+        for queue in self.queues.get() {
+            queue.close()
+        }
+    }
+}
+
+fn create_pool(count: usize, capacity: usize) -> Result[(Pool, Vec[JoinHandle[u32]]), SpawnError] {
+    let mut workers = Vec[JoinHandle[u32]]::new()
+    let mut queues = Vec[Sender[Job]]::new()
+    for _ in 0_usize..count {
+        let pair = match bounded[Job](capacity) {
+            Result::Ok(value) => value
+            Result::Err(_) => {
+                for queue in queues {
+                    queue.close()
+                }
+                for thread in workers {
+                    thread.join()
+                }
+                ret Result::Err(SpawnError::InvalidCapacity)
+            }
+        }
+        queues.push(pair.0)
+        workers.push(spawn worker_main(into_receiver[Job](pair), capacity))
+    }
+    ret Result::Ok((Pool { Frozen[Vec[Sender[Job]]]::new(queues), AtomicU64::new(0_u64) }, workers))
+}
+
+pub struct Handle {
+    queue: Pool
+    blocking_queue: Pool
+    shutdown_token: CancellationToken
+}
+
+#attr(safe)
+pub fn current() -> Option[Handle] {
+    let payload = encore_asyncio_current()
+    if payload == 0_usize {
+        ret Option::None
+    }
+    let handle = __payload_take_local[Handle](payload)
+    encore_asyncio_set_current(__payload_new[Handle](handle))
+    ret Option::Some(handle)
+}
+
+#attr(safe)
+fn restore_current(previous: usize) ->() {
+    let current = encore_asyncio_set_current(previous)
+    __payload_drop[Handle](current)
+}
+
+impl for Handle {
+    #attr(reflection_template, scoped_reflection_template)
+    pub fn spawn_task[T, F: Future[T]](self: Self, future: sending F) -> Result[TaskHandle[T], SpawnError] {
+        ret self.submit[T, F](self.queue, future)
+    }
+    #attr(reflection_template, scoped_reflection_template)
+    pub fn spawn_blocking[T, F: Future[T]](self: Self, future: sending F) -> Result[TaskHandle[T], SpawnError] {
+        ret self.submit[T, F](self.blocking_queue, future)
+    }
+    #attr(reflection_template, scoped_reflection_template)
+    fn submit[T, F: Future[T]](self: Self, queue: Pool, future: sending F) -> Result[TaskHandle[T], SpawnError] {
+        let output = match bounded[Completion](1_usize) {
+            Result::Ok(channel) => channel
+            Result::Err(_) => {
+                ret Result::Err(SpawnError::InvalidCapacity)
+            }
+        }
+        let cancellation = self.shutdown_token.child()
+        let task = Task[T, F] {
+            cancellable[T, F](future, cancellation), output.0, self, cancellation
+        }
+        let job = Job {
+            __payload_new[Task[T, F]](task), __poll_address[T, F](), __payload_drop_address[Task[T, F]](), 0_usize
+        }
+        if job.poller == 0_usize || job.dropper == 0_usize {
+            core::panic::panic("asyncio task adapter was not lowered")
+        }
+        if queue.send(job) {
+            ret Result::Ok(TaskHandle[T] { output.1.receive(), cancellation })
+        }
+        free_job(job)
+        ret Result::Err(SpawnError::ClosedOrFull)
+    }
+}
+
+/// Schedules a future on a worker, keeping its suspended state on that worker.
+#attr(reflection_template)
+pub fn spawn_task[T, F: Future[T]](runtime: Handle, future: sending F) -> Result[TaskHandle[T], SpawnError] {
+    ret runtime.spawn_task[T, F](future)
+}
+
+/// Submits a future whose poll may block to the dedicated blocking pool.
+#attr(reflection_template)
+pub fn spawn_blocking[T, F: Future[T]](runtime: Handle, future: sending F) -> Result[TaskHandle[T], SpawnError] {
+    ret runtime.spawn_blocking[T, F](future)
+}
+
+pub struct Runtime {
+    handle_value: Handle
+    workers: Vec[JoinHandle[u32]]
+}
+
+impl for Runtime {
+    pub fn new(worker_count: usize, blocking_count: usize, queue_capacity: usize) -> Result[Self, SpawnError] {
+        if worker_count == 0_usize || blocking_count == 0_usize || queue_capacity == 0_usize {
+            ret Result::Err(SpawnError::InvalidCapacity)
+        }
+        let queue = create_pool(worker_count, queue_capacity)?
+        let blocking = match create_pool(blocking_count, queue_capacity) {
+            Result::Ok(value) => value
+            Result::Err(error) => {
+                queue.0.close()
+                for thread in queue.1 {
+                    thread.join()
+                }
+                ret Result::Err(error)
+            }
+        }
+        let mut workers = queue.1
+        workers.extend(blocking.1)
+        ret Result::Ok(Self {
+                Handle { queue.0, blocking.0, CancellationToken::new() }, workers
+            }
+        )
+    }
+    #attr(borrowed_self)
+    pub fn handle(self: Self) -> Handle {
+        ret self.handle_value
+    }
+    #attr(borrowed_self)
+    #attr(reflection_template, scoped_reflection_template)
+    pub fn block_on[T, F: Future[T]](self: Self, future: F) -> T {
+        let waker = encore_async_waker_new()
+        if waker == 0_usize {
+            core::panic::panic("cannot allocate runtime waker")
+        }
+        let previous = encore_asyncio_set_current(__payload_new[Handle](self.handle_value))
+        let mut pending = future.poll(context(waker))
+        loop {
+            match pending {
+                Poll::Ready(output) => {
+                    restore_current(previous) encore_async_waker_drop(waker) ret output
+                }
+                Poll::Pending(next) => {
+                    encore_async_waker_wait(waker)
+                    pending = next.poll(context(waker))
+                }
+            }
+        }
+    }
+    pub fn shutdown(self: Self) ->() {
+        self.handle_value.queue.close()
+        self.handle_value.blocking_queue.close()
+        self.handle_value.shutdown_token.cancel()
+        for thread in self.workers {
+            thread.join()
+        }
+    }
+}
+
+#attr(reflection_template)
+pub fn run_main[F: Future[u32]](future: F) -> u32 {
+    let runtime = match Runtime::new(available_parallelism(), 4_usize, 1024_usize) {
+        Result::Ok(value) => value
+        Result::Err(_) => {
+            ret 1_u32
+        }
+    }
+    let code = runtime.block_on[u32, F](future)
+    runtime.shutdown()
+    ret code
+}

@@ -80,7 +80,10 @@ def main() -> int:
             fcntl.flock(lease, fcntl.LOCK_EX)
             gc_env = dict(env, ENCORE_BUILD_CACHE_MAX_SIZE="0B")
             samples = []
-            for _ in range(200):
+            # Each build gives the collector a wall-clock slice, so runner
+            # speed determines how many builds a complete scan needs.
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
                 (cache / ".maintenance-last").write_text("0")
                 started = time.monotonic()
                 run = subprocess.run(command, cwd=project, env=gc_env, capture_output=True, text=True, timeout=30)
