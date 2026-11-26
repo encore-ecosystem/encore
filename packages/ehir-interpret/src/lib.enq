@@ -1,0 +1,868 @@
+//! A host-independent executor for the synchronous typed EHIR subset.
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+
+import std::io::println
+import std::vec::Vec
+
+import ehir_core::{BinaryOpKind, CallInstruction, Directive, FnDirective, Instruction, Module, RepresentationKind, Type, ValueKind, Variable, flatten_module_bundle, make_type, normalize_control_flow, try_parse_module_bundle_text, type_to_string, validate_module}
+
+pub fn parse_program(source: str) -> Result[Module, str] {
+    let mut start = 0_usize
+    while start < source.byte_len() && source.byte_at(start) <= 32_u8 {
+        start += 1_usize
+    }
+    let text = source.slice_bytes(start, source.byte_len() - start)
+    let wrapped = if text.range_eq(0_usize, 7_usize, "module ") || text.range_eq(0_usize, 6_usize, "entry ") {
+        source
+    } else {
+        "module input {\n" + source + "\n}\n"
+    }
+    let bundle = try_parse_module_bundle_text("input", wrapped)?
+    ret validate_module(flatten_module_bundle("input", bundle))
+}
+
+enum Value {
+    Unit
+    Number(u64)
+    Aggregate(Vec[usize])
+    Variant((str, usize))
+    Place(usize)
+    Cursor(usize)
+}
+
+struct Frame {
+    function: FnDirective
+    locals: Vec[(str, usize)]
+    block_index: usize
+    instruction_index: usize
+    predecessor: str
+    cleanups: Vec[CallInstruction]
+    type_names: Vec[str]
+    type_values: Vec[Type]
+}
+
+struct CursorState {
+    frame: Frame
+    status: CursorStatus
+    references: usize
+}
+
+enum CursorStatus {
+    Suspended
+    Running
+    Exhausted
+}
+
+struct Machine {
+    source: str
+    module: Module
+    values: Vec[Value]
+    places: Vec[usize]
+    cursors: Vec[CursorState]
+    steps: usize
+}
+
+enum Stop {
+    Return(usize)
+    Yield(usize)
+}
+
+fn allocate(vm: mut Machine, value: Value) -> usize {
+    let id = vm.values.len()
+    vm.values.push(value)
+    ret id
+}
+
+fn value(vm: Machine, id: usize) -> Value {
+    ret vm.values.get(id).unwrap_or(Value::Unit)
+}
+
+fn block_name(frame: Frame) -> str {
+    ret match frame.function.blocks.get(frame.block_index) {
+        Some(block) => block.name
+        None => "<entry>"
+    }
+}
+
+fn failure(frame: Frame, message: str) -> str {
+    ret frame.function.name + " / $" + block_name(frame) + " / instruction " + Debug::fmt(frame.instruction_index + 1_usize) + ": " + message
+}
+
+// Normalization can move or replace instructions. The original block header
+// is a stable source anchor even when the normalized instruction has no line.
+fn source_block_line(source: str, function: str, block: str) -> usize {
+    let mut start = 0_usize
+    let mut line = 1_usize
+    let mut in_function = false
+    while start < source.byte_len() {
+        let end = source.find_byte_from(10_u8, start)
+        while start < end && source.byte_at(start) <= 32_u8 {
+            start += 1_usize
+        }
+        if source.range_eq(start, 3_usize, "fn ") ||
+        source.range_eq(start, 13_usize, "generator fn ") || source.range_eq(start, 9_usize, "async fn ") {
+            let name_start = source.find_from("fn ", start) + 3_usize
+            let next = name_start + function.byte_len()
+            in_function = source.range_eq(name_start, function.byte_len(), function) &&
+            (source.byte_at(next) == 40_u8 || source.byte_at(next) == 91_u8)
+        } elif in_function && source.range_eq(start, block.byte_len() + 2_usize, "$" + block + ":") {
+            ret line
+        }
+        start = end + 1_usize
+        line += 1_usize
+    }
+    ret 0_usize
+}
+
+fn slot(frame: Frame, name: str) -> Option[usize] {
+    let mut i = frame.locals.len()
+    while i > 0_usize {
+        i -= 1_usize
+        if frame.locals.get_unchecked_borrowed(i).0 == name {
+            ret Option[usize]::Some(i)
+        }
+    }
+    ret Option[usize]::None
+}
+
+fn assign(frame: mut Frame, name: str, id: usize) ->() {
+    match slot(frame, name) {
+        Some(i) => {
+            frame.locals.set(i,(name, id))
+        }
+        None => {
+            frame.locals.push((name, id))
+        }
+    }
+}
+
+fn get(frame: Frame, operand: Variable) -> Result[usize, str] {
+    if operand.kind == ValueKind::Unit {
+        ret Result::Ok(0_usize)
+    }
+    match slot(frame, operand.name) {
+        Some(i) => {
+            ret Result::Ok(frame.locals.get_unchecked_borrowed(i).1)
+        }
+        None => {
+            ret Result::Err(failure(frame, "undefined value " + operand.name))
+        }
+    }
+}
+
+fn concrete(frame: Frame, typ: Type) -> Type {
+    if !typ.generics.is_empty() {
+        let mut args = Vec[Type]::new()
+        for child in typ.generics {
+            args.push(concrete(frame, child))
+        }
+        ret make_type(typ.name, args, typ.representation)
+    }
+    let mut index = 0_usize
+    for name in frame.type_names {
+        if typ.name == name {
+            ret frame.type_values.get(index).unwrap_or(typ)
+        }
+        index += 1_usize
+    }
+    ret typ
+}
+
+fn width(name: str) -> u64 {
+    ret match name {
+        "bool" => 1_u64
+        "u1" => 1_u64
+        "u8" => 8_u64
+        "i8" => 8_u64
+        "u16" => 16_u64
+        "i16" => 16_u64
+        "u32" => 32_u64
+        "i32" => 32_u64
+        "u64" => 64_u64
+        "i64" => 64_u64
+        "usize" => 64_u64
+        "isize" => 64_u64
+        _ => 0_u64
+    }
+}
+
+fn mask(bits: u64) -> u64 {
+    ret if bits == 64_u64 {
+        18446744073709551615_u64
+    } else {
+        (1_u64 << bits) - 1_u64
+    }
+}
+
+fn signed(name: str) -> bool {
+    ret name.byte_len() > 0_usize && name.byte_at(0_usize) == 105_u8
+}
+
+fn signed_value(bits: u64, size: u64) -> i64 {
+    if size == 64_u64 ||(bits &(1_u64 <<(size - 1_u64))) == 0_u64 {
+        ret bits as i64
+    }
+    ret(bits |(mask(size) ^ mask(64_u64))) as i64
+}
+
+fn integer(text: str) -> Result[u64, str] {
+    if text == "true" {
+        ret Result::Ok(1_u64)
+    }
+    if text == "false" {
+        ret Result::Ok(0_u64)
+    }
+    let mut i = 0_usize
+    let negative = text.byte_len() > 0_usize && text.byte_at(0_usize) == 45_u8
+    if negative {
+        i += 1_usize
+    }
+    let mut base = 10_u64
+    if i + 1_usize < text.byte_len() && text.byte_at(i) == 48_u8 {
+        let prefix = text.byte_at(i + 1_usize)
+        if prefix == 120_u8 || prefix == 88_u8 {
+            base = 16_u64 i += 2_usize
+        } elif prefix == 98_u8 || prefix == 66_u8 {
+            base = 2_u64 i += 2_usize
+        } elif prefix == 111_u8 || prefix == 79_u8 {
+            base = 8_u64 i += 2_usize
+        }
+    }
+    let mut result = 0_u64
+    let mut digits = 0_usize
+    while i < text.byte_len() {
+        let ch = text.byte_at(i)
+        if ch == 95_u8 {
+            break
+        }
+        let digit = if ch >= 48_u8 && ch <= 57_u8 {
+            (ch - 48_u8) as u64
+        } elif ch >= 97_u8 && ch <= 102_u8 {
+            (ch - 87_u8) as u64
+        } elif ch >= 65_u8 && ch <= 70_u8 {
+            (ch - 55_u8) as u64
+        } else {
+            ret Result::Err("invalid integer constant " + text)
+        }
+        if digit >= base || result >(mask(64_u64) - digit) / base {
+            ret Result::Err("integer constant out of range " + text)
+        }
+        result = result * base + digit
+        digits += 1_usize
+        i += 1_usize
+    }
+    if digits == 0_usize {
+        ret Result::Err("invalid integer constant " + text)
+    }
+    ret Result::Ok(if negative {
+            0_u64 - result
+        } else {
+            result
+        }
+    )
+}
+
+fn number(vm: Machine, id: usize) -> Result[u64, str] {
+    match value(vm, id) {
+        Number(bits) => {
+            ret Result::Ok(bits)
+        }
+        _ => {
+            ret Result::Err("expected an integer value")
+        }
+    }
+}
+
+fn compare(a: u64, b: u64, typ: str, bits: u64) ->(bool, bool) {
+    if signed(typ) {
+        let l = signed_value(a, bits)
+        let r = signed_value(b, bits)
+        ret(l < r, l == r)
+    }
+    ret(a < b, a == b)
+}
+
+fn binary(op: BinaryOpKind, a: u64, b: u64, typ: str) -> Result[u64, str] {
+    let bits = width(typ)
+    if bits == 0_u64 {
+        ret Result::Err("unsupported integer type " + typ)
+    }
+    if (op == BinaryOpKind::DIV || op == BinaryOpKind::MOD) && b == 0_u64 {
+        ret Result::Err("division by zero")
+    }
+    if (op == BinaryOpKind::SHL || op == BinaryOpKind::SHR) && b >= bits {
+        ret Result::Err("shift out of range")
+    }
+    let order = compare(a, b, typ, bits)
+    let result = match op {
+        ADD => a + b
+        SUB => a - b
+        MUL => a * b
+        DIV => {
+            ret divide(a, b, typ, bits, false)
+        }
+        MOD => {
+            ret divide(a, b, typ, bits, true)
+        }
+        SHL => a << b
+        SHR => if signed(typ) {
+            (signed_value(a, bits) >>(b as i64)) as u64
+        } else {
+            a >> b
+        }
+        LES => if order.0 {
+            1_u64
+        } else {
+            0_u64
+        }
+        LEQ => if order.0 || order.1 {
+            1_u64
+        } else {
+            0_u64
+        }
+        GRT => if !order.0 && !order.1 {
+            1_u64
+        } else {
+            0_u64
+        }
+        GEQ => if !order.0 {
+            1_u64
+        } else {
+            0_u64
+        }
+        IEQ => if order.1 {
+            1_u64
+        } else {
+            0_u64
+        }
+        NEQ => if !order.1 {
+            1_u64
+        } else {
+            0_u64
+        }
+        AND => a & b
+        OR => a | b
+        XOR => a ^ b
+    }
+    ret Result::Ok(result & mask(bits))
+}
+
+fn divide(a: u64, b: u64, typ: str, bits: u64, remainder: bool) -> Result[u64, str] {
+    if !signed(typ) {
+        ret Result::Ok(if remainder {
+                a % b
+            } else {
+                a / b
+            }
+        )
+    }
+    let lhs = signed_value(a, bits)
+    let rhs = signed_value(b, bits)
+    if a ==(1_u64 <<(bits - 1_u64)) && rhs == - 1_i64 {
+        ret Result::Err("signed division overflow")
+    }
+    let result = if remainder {
+        lhs % rhs
+    } else {
+        lhs / rhs
+    }
+    ret Result::Ok((result as u64) & mask(bits))
+}
+
+fn arguments(frame: Frame, operands: Vec[Variable]) -> Result[Vec[usize], str] {
+    let mut args = Vec[usize]::new()
+    for operand in operands {
+        args.push(get(frame, operand)?)
+    }
+    ret Result::Ok(args)
+}
+
+fn jump(frame: mut Frame, label: str) -> Result[(), str] {
+    let previous = frame.function.blocks.get_unchecked_borrowed(frame.block_index).name
+    let mut index = 0_usize
+    for block in frame.function.blocks {
+        if block.name == label {
+            frame.predecessor = previous
+            frame.block_index = index
+            frame.instruction_index = 0_usize
+            ret Result::Ok(())
+        }
+        index += 1_usize
+    }
+    ret Result::Err(failure(frame, "unknown block " + label))
+}
+
+fn enter_phis(frame: mut Frame) -> Result[(), str] {
+    let block = frame.function.blocks.get_unchecked_borrowed(frame.block_index)
+    let mut pending = Vec[(str, usize)]::new()
+    for inst in block.instructions {
+        match inst {
+            Phi(phi) => {
+                let mut found = false
+                for incoming in phi.pairs {
+                    if incoming.label == frame.predecessor {
+                        pending.push((phi.out.name, get(frame, incoming.value)?))
+                        found = true
+                        break
+                    }
+                }
+                if !found {
+                    ret Result::Err(failure(frame, "missing phi predecessor"))
+                }
+                frame.instruction_index += 1_usize
+            }
+            _ => {
+                break
+            }
+        }
+    }
+    for pair in pending {
+        assign(frame, pair.0, pair.1)
+    }
+    ret Result::Ok(())
+}
+
+fn field_index(vm: Machine, typ: Type, name: str) -> Result[usize, str] {
+    match integer(name) {
+        Ok(index) => {
+            ret Result::Ok(index as usize)
+        }
+        Err(_) => {
+        }
+    }
+    for directive in vm.module.directives {
+        match directive {
+            Struct(item) => {
+                if item.name == typ.name {
+                    for i in 0_usize..item.fields.len() {
+                        if item.fields.get_unchecked_borrowed(i).name == name {
+                            ret Result::Ok(i)
+                        }
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret Result::Err("unknown field " + name)
+}
+
+fn function(vm: Machine, name: str) -> Result[FnDirective, str] {
+    for directive in vm.module.directives {
+        match directive {
+            Function(item) => {
+                if item.name == name {
+                    ret Result::Ok(item)
+                }
+            }
+            Impl(implementation) => {
+                for method in implementation.methods {
+                    if implementation.for_type.name + "::" + method.name == name {
+                        ret Result::Ok(method)
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    ret Result::Err("unknown function " + name)
+}
+
+fn start_frame(item: FnDirective, args: Vec[usize], types: Vec[Type]) -> Result[Frame, str] {
+    if item.is_async || item.is_extern || item.blocks.is_empty() {
+        ret Result::Err("unsupported function " + item.name)
+    }
+    if item.params.len() != args.len() || item.generics.len() != types.len() {
+        ret Result::Err("wrong argument count for " + item.name)
+    }
+    let mut names = Vec[str]::new()
+    for generic in item.generics {
+        names.push(generic.name)
+    }
+    let mut frame = Frame {
+        item, Vec[(str, usize)]::new(), 0_usize, 0_usize, "", Vec[CallInstruction]::new(), names, types
+    }
+    for i in 0_usize..args.len() {
+        let name = item.params.get_unchecked_borrowed(i).name
+        assign(frame, name, args.get_unchecked_borrowed(i))
+    }
+    ret Result::Ok(frame)
+}
+
+fn call_value(vm: mut Machine, frame: Frame, call: CallInstruction, depth: usize) -> Result[usize, str] {
+    let args = arguments(frame, call.args)?
+    if call.name == "ehir_println_u64" && args.len() == 1_usize {
+        println(Debug::fmt(number(vm, args.get_unchecked_borrowed(0_usize))?))
+        ret Result::Ok(0_usize)
+    }
+    if args.len() == 1_usize && call.name == "Generator::next" {
+        let receiver = args.get_unchecked_borrowed(0_usize)
+        match value(vm, receiver) {
+            Cursor(cursor) => {
+                ret next_cursor(vm, cursor, receiver, depth)
+            }
+            _ => {
+            }
+        }
+    }
+    if depth >= 512_usize {
+        ret Result::Err("call depth limit reached")
+    }
+    let item = function(vm, call.name)?
+    let mut types = Vec[Type]::new()
+    for typ in call.generics {
+        types.push(concrete(frame, typ))
+    }
+    let mut child = start_frame(item, args, types)?
+    if item.generator_type.is_some() {
+        let id = vm.cursors.len()
+        vm.cursors.push(CursorState { child, CursorStatus::Suspended, 1_usize })
+        ret Result::Ok(allocate(vm, Value::Cursor(id)))
+    }
+    match execute(vm, child, depth + 1_usize)? {
+        Return(id) => {
+            ret Result::Ok(id)
+        }
+        Yield(_) => {
+            ret Result::Err("yield from a non-generator call")
+        }
+    }
+}
+
+fn next_cursor(vm: mut Machine, index: usize, receiver: usize, depth: usize) -> Result[usize, str] {
+    if depth >= 512_usize {
+        ret Result::Err("call depth limit reached")
+    }
+    let mut state = vm.cursors.get_unchecked_borrowed(index)
+    if state.references == 0_usize {
+        ret Result::Err("generator has been dropped")
+    }
+    if state.status == CursorStatus::Running {
+        ret Result::Err("generator is already running")
+    }
+    let mut item = Value::Variant(("None", 0_usize))
+    if state.status == CursorStatus::Suspended {
+        state.status = CursorStatus::Running
+        vm.cursors.set(index, state)
+        let mut frame = state.frame
+        let stop = execute(vm, frame, depth + 1_usize)?
+        state = vm.cursors.get_unchecked_borrowed(index)
+        state.frame = frame
+        match stop {
+            Yield(id) => {
+                state.status = CursorStatus::Suspended
+                item = Value::Variant(("Some", id))
+            }
+            Return(_) => {
+                state.status = CursorStatus::Exhausted
+            }
+        }
+        vm.cursors.set(index, state)
+    }
+    let option = allocate(vm, item)
+    ret Result::Ok(allocate(vm, Value::Aggregate(vec![receiver, option])))
+}
+
+fn ownership(vm: mut Machine, id: usize, retain: bool, depth: usize) -> Result[(), str] {
+    if depth >= 512_usize {
+        ret Result::Err("ownership traversal limit reached")
+    }
+    match value(vm, id) {
+        Aggregate(children) => {
+            for child in children {
+                ownership(vm, child, retain, depth + 1_usize)?
+            }
+        }
+        Variant(item) => {
+            ownership(vm, item.1, retain, depth + 1_usize)?
+        }
+        Cursor(index) => {
+            let mut state = vm.cursors.get_unchecked_borrowed(index)
+            if state.references == 0_usize {
+                ret Result::Err("generator has been dropped")
+            }
+            if retain {
+                state.references += 1_usize
+            } else {
+                state.references -= 1_usize
+            }
+            if state.references == 0_usize && state.status == CursorStatus::Suspended {
+                state.status = CursorStatus::Exhausted
+                vm.cursors.set(index, state)
+                for cleanup in state.frame.cleanups {
+                    let _ = call_value(vm, state.frame, cleanup, depth + 1_usize)?
+                }
+            } else {
+                vm.cursors.set(index, state)
+            }
+        }
+        _ => {
+        }
+    }
+    ret Result::Ok(())
+}
+
+fn execute(vm: mut Machine, frame: mut Frame, depth: usize) -> Result[Stop, str] {
+    loop {
+        if vm.steps == 0_usize {
+            ret Result::Err(failure(frame, "instruction limit reached"))
+        }
+        vm.steps -= 1_usize
+        if frame.instruction_index == 0_usize {
+            enter_phis(frame)?
+        }
+        let block = frame.function.blocks.get_unchecked_borrowed(frame.block_index)
+        while frame.instruction_index < block.instructions.len() {
+            if vm.steps == 0_usize {
+                ret Result::Err(failure(frame, "instruction limit reached"))
+            }
+            vm.steps -= 1_usize
+            let inst = block.instructions.get_unchecked_borrowed(frame.instruction_index)
+            match inst {
+                Yield(item) => {
+                    let id = get(frame, item.value)?
+                    frame.cleanups = item.cleanups
+                    frame.instruction_index += 1_usize
+                    ret Result::Ok(Stop::Yield(id))
+                }
+                _ => {
+                    match instruction(vm, frame, inst, depth) {
+                        Ok(_) => {
+                        }
+                        Err(message) => {
+                            let line = source_block_line(vm.source, frame.function.name, block.name)
+                            let origin = if line == 0_usize {
+                                ""
+                            } else {
+                                Debug::fmt(line) + ": "
+                            }
+                            ret Result::Err(origin + failure(frame, message))
+                        }
+                    }
+                }
+            }
+            frame.instruction_index += 1_usize
+        }
+        match block.terminator {
+            Ret(item) => {
+                frame.cleanups = Vec[CallInstruction]::new()
+                ret Result::Ok(Stop::Return(get(frame, item.value)?))
+            }
+            Br(item) => {
+                jump(frame, item.label)?
+            }
+            Cbr(item) => {
+                let cond = number(vm, get(frame, item.cond)?)?
+                jump(frame, if cond == 0_u64 {
+                        item.false_label
+                    } else {
+                        item.true_label
+                    }
+                    ,
+                )?
+            }
+            Match(item) => {
+                let scrutinee = value(vm, get(frame, item.scrutinee)?)
+                let tagged = match scrutinee {
+                    Variant(tagged) => tagged
+                    _ => {
+                        ret Result::Err(failure(frame, "match expects an enum"))
+                    }
+                }
+                let mut label = item.default_label
+                for arm in item.arms {
+                    if arm.variant == tagged.0 {
+                        label = arm.label
+                        match arm.payload_var {
+                            Some(operand) => {
+                                assign(frame, operand.name, tagged.1)
+                            }
+                            None => {
+                            }
+                        }
+                        break
+                    }
+                }
+                jump(frame, label)?
+            }
+            Switch(item) => {
+                let bits = number(vm, get(frame, item.scrutinee)?)?
+                let size = width(concrete(frame, item.scrutinee.typ).name)
+                let mut label = item.default_label
+                for branch in item.cases {
+                    if (integer(branch.value)? & mask(size)) == bits {
+                        label = branch.label
+                        break
+                    }
+                }
+                jump(frame, label)?
+            }
+            Unreachable => {
+                ret Result::Err(failure(frame, "reached unreachable"))
+            }
+        }
+    }
+}
+
+fn instruction(vm: mut Machine, frame: mut Frame, inst: Instruction, depth: usize) -> Result[(), str] {
+    match inst {
+        Comment(_) => {
+        }
+        Lcpos(item) => {
+            let typ = concrete(frame, item.out.typ)
+            let bits = width(typ.name)
+            if bits == 0_u64 {
+                ret Result::Err("unsupported constant type " + type_to_string(typ))
+            }
+            assign(frame, item.out.name, allocate(vm, Value::Number(integer(item.value)? & mask(bits))))
+        }
+        Alias(item) => {
+            assign(frame, item.out.name, get(frame, item.src)?)
+        }
+        Lcsos(item) => {
+            if item.typ.representation != RepresentationKind::Inline {
+                ret Result::Err("unsupported aggregate representation")
+            }
+            let fields = arguments(frame, item.args)?
+            assign(frame, item.out.name, allocate(vm, Value::Aggregate(fields)))
+        }
+        Lceos(item) => {
+            let payload = match item.value.payload {
+                Some(operand) => get(frame, operand)?
+                None => 0_usize
+            }
+            assign(frame, item.out.name, allocate(vm, Value::Variant((item.value.variant, payload))))
+        }
+        GetField(item) => {
+            match value(vm, get(frame, item.src)?) {
+                Aggregate(fields) => {
+                    let index = field_index(vm, concrete(frame, item.src.typ), item.field.name)?
+                    match fields.get(index) {
+                        Some(id) => {
+                            assign(frame, item.out.name, id)
+                        }
+                        None => {
+                            ret Result::Err("field index out of range")
+                        }
+                    }
+                }
+                Variant(tagged) => {
+                    if tagged.0 != item.field.name {
+                        ret Result::Err("inactive enum variant " + item.field.name)
+                    }
+                    assign(frame, item.out.name, tagged.1)
+                }
+                _ => {
+                    ret Result::Err("expected an aggregate")
+                }
+            }
+        }
+        StackAlloc(item) => {
+            let place = vm.places.len()
+            vm.places.push(0_usize)
+            assign(frame, item.out.name, allocate(vm, Value::Place(place)))
+        }
+        Load(item) => {
+            match value(vm, get(frame, item.src)?) {
+                Place(place) => {
+                    assign(frame, item.out.name, vm.places.get_unchecked_borrowed(place))
+                }
+                _ => {
+                    ret Result::Err("load requires an interpreter stack place")
+                }
+            }
+        }
+        Store(item) => {
+            match value(vm, get(frame, item.dst)?) {
+                Place(place) => {
+                    let id = get(frame, item.src)?
+                    ownership(vm, id, true, depth)?
+                    vm.places.set(place, id)
+                }
+                _ => {
+                    ret Result::Err("store requires an interpreter stack place")
+                }
+            }
+        }
+        PtrCast(item) => {
+            let source = concrete(frame, item.src.typ)
+            let target = concrete(frame, item.target_type)
+            let bits = width(target.name)
+            let from_bits = width(source.name)
+            if bits == 0_u64 || from_bits == 0_u64 || source.representation != RepresentationKind::Inline ||
+            target.representation != RepresentationKind::Inline {
+                ret Result::Err("only integer casts are supported")
+            }
+            let raw = number(vm, get(frame, item.src)?)?
+            let extended = if signed(source.name) {
+                signed_value(raw, from_bits) as u64
+            } else {
+                raw
+            }
+            assign(frame, item.out.name, allocate(vm, Value::Number(extended & mask(bits))))
+        }
+        Binary(item) => {
+            if item.rhs.kind == ValueKind::EnumTag {
+                if item.op != BinaryOpKind::IEQ && item.op != BinaryOpKind::NEQ {
+                    ret Result::Err("enum tags support equality comparisons")
+                }
+                let actual = match value(vm, get(frame, item.lhs)?) {
+                    Variant(tagged) => tagged.0
+                    _ => {
+                        ret Result::Err("enum comparison requires a variant")
+                    }
+                }
+                let equal = actual == item.rhs.name
+                let bits = if equal ==(item.op == BinaryOpKind::IEQ) {
+                    1_u64
+                } else {
+                    0_u64
+                }
+                assign(frame, item.out.name, allocate(vm, Value::Number(bits)))
+                ret Result::Ok(())
+            }
+            let lhs = number(vm, get(frame, item.lhs)?)?
+            let rhs = number(vm, get(frame, item.rhs)?)?
+            let typ = concrete(frame, item.lhs.typ)
+            assign(frame, item.out.name, allocate(vm, Value::Number(binary(item.op, lhs, rhs, typ.name)?)))
+        }
+        Call(item) => {
+            let id = call_value(vm, frame, item, depth)?
+            assign(frame, item.out.name, id)
+        }
+        Drop(item) => {
+            ownership(vm, get(frame, item.value)?, false, depth)?
+        }
+        Retain(item) => {
+            ownership(vm, get(frame, item.value)?, true, depth)?
+        }
+        _ => {
+            ret Result::Err("unsupported instruction in the synchronous subset")
+        }
+    }
+    ret Result::Ok(())
+}
+
+pub fn interpret(source: str) -> Result[u32, str] {
+    let module = normalize_control_flow(parse_program(source)?)
+    let mut vm = Machine {
+        source, module, vec![Value::Unit], Vec[usize]::new(), Vec[CursorState]::new(), 1000000_usize
+    }
+    let main = function(vm, "main")?
+    if !main.params.is_empty() || main.ret_type.name != "u32" || main.generator_type.is_some() {
+        ret Result::Err("entrypoint must be fn main() -> u32")
+    }
+    let mut frame = start_frame(main, Vec[usize]::new(), Vec[Type]::new())?
+    match execute(vm, frame, 0_usize)? {
+        Return(id) => {
+            ret Result::Ok(number(vm, id)? as u32)
+        }
+        Yield(_) => {
+            ret Result::Err("entrypoint cannot suspend")
+        }
+    }
+}

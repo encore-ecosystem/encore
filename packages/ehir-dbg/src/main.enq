@@ -1,0 +1,78 @@
+import core::fmt::Debug
+
+import std::io::{eprintln, println}
+import std::os::{arch_name, argc, argv, env, file_exists, mkdir, os_name, read_file, remove_dir_all, write_file_atomic}
+import std::path::Path
+import std::process::Command
+import std::time::perf_counter_ns
+
+import refrain::debug_ir
+
+fn main() -> u32 {
+    let input = argv(1_usize).unwrap_or("")
+    if input == "--help" || input == "-h" {
+        println("Usage: ehir-dbg <input.ehir> -o <output.o>")
+        ret 0_u32
+    }
+    let output = argv(3_usize).unwrap_or("")
+    if argc() != 4_usize || argv(2_usize).unwrap_or("") != "-o" || output == "" {
+        eprintln("Usage: ehir-dbg <input.ehir> -o <output.o>")
+        ret 2_u32
+    }
+    if !file_exists(input) {
+        eprintln("ehir-dbg: input not found: " + input)
+        ret 2_u32
+    }
+    let os = os_name()
+    let arch = arch_name()
+    if !((os == "macos" && arch == "aarch64") ||(os == "linux" && arch == "x86_64")) {
+        eprintln("ehir-dbg: supported hosts are macOS ARM and Linux x86-64")
+        ret 2_u32
+    }
+    let triple = arch + if os == "macos" {
+        "-apple-darwin"
+    } else {
+        "-unknown-linux-gnu"
+    }
+    let source = Path::new(input).resolve()
+    let destination = Path::new(output).resolve()
+    if source.as_str() == destination.as_str() {
+        eprintln("ehir-dbg: input and output paths must differ")
+        ret 2_u32
+    }
+    let text = match debug_ir(read_file(source.as_str()), source.as_str(), triple) {
+        Ok(ir) => ir
+        Err(message) => {
+            eprintln("ehir-dbg: " + message) ret 1_u32
+        }
+    }
+    let staging = Path::new(destination.as_str() + ".ehir-dbg-" + Debug::fmt(perf_counter_ns()))
+    if mkdir(staging.as_str()) != 0_i32 {
+        eprintln("ehir-dbg: cannot create output staging directory")
+        ret 1_u32
+    }
+    let status = assemble(text, triple, staging, destination)
+    let _removed = remove_dir_all(staging.as_str())
+    ret status
+}
+
+fn assemble(text: str, triple: str, staging: Path, destination: Path) -> u32 {
+    let ir = staging.join("module.ll").as_str()
+    let object = staging.join("module.o").as_str()
+    if write_file_atomic(ir, text) != 0_i32 {
+        eprintln("ehir-dbg: cannot stage LLVM IR")
+        ret 1_u32
+    }
+    let compiler = env("CC").unwrap_or("clang")
+    let result = Command::new(compiler).arg("--target=" + triple).arg("-x").arg("ir").arg("-O0")
+    .arg("-g").arg("-c").arg(ir).arg("-o").arg(object).output()
+    if !result.success() || !file_exists(object) {
+        eprintln("ehir-dbg: native compiler failed: " + result.text())
+        ret 1_u32
+    }
+    if write_file_atomic(destination.as_str(), read_file(object)) != 0_i32 {
+        eprintln("ehir-dbg: cannot publish object file")
+        ret 1_u32
+    }
+    ret 0_u32
+}

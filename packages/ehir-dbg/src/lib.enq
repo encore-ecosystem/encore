@@ -1,0 +1,387 @@
+//! The debug-only adapter for the existing LLVM backend.
+import core::fmt::Debug
+import core::option::Option
+import core::result::Result
+
+import std::vec::Vec
+
+import ehir_core::{Directive, Parameter, Type, extern_fn_item, flatten_module_bundle, make_module, param, plain_type, try_parse_module_bundle_text}
+import ehir_llvm_backend::codegen::{clear_codegen_error, emit_ir_for_target, take_codegen_error}
+
+fn prefix(text: str, start: str) -> bool {
+    ret text.range_eq(0_usize, start.byte_len(), start)
+}
+
+fn trim(text: str) -> str {
+    let mut start = 0_usize
+    let mut end = text.byte_len()
+    while start < end && text.byte_at(start) <= 32_u8 {
+        start += 1_usize
+    }
+    while end > start && text.byte_at(end - 1_usize) <= 32_u8 {
+        end -= 1_usize
+    }
+    ret text.slice_bytes(start, end - start)
+}
+
+fn lines(text: str) -> Vec[str] {
+    let mut result = Vec[str]::new()
+    let mut start = 0_usize
+    while start < text.byte_len() {
+        let end = text.find_byte_from(10_u8, start)
+        result.push(text.slice_bytes(start, end - start))
+        start = end + 1_usize
+    }
+    ret result
+}
+
+fn quote(text: str) -> str {
+    let hex = "0123456789ABCDEF"
+    let mut result = "\""
+    for i in 0_usize..text.byte_len() {
+        let byte = text.byte_at(i)
+        if byte == 34_u8 || byte == 92_u8 || byte < 32_u8 || byte >= 127_u8 {
+            let high =(byte >> 4_u8) as usize
+            let low =(byte & 15_u8) as usize
+            result += "\\" + hex.slice(high, 1_usize) + hex.slice(low, 1_usize)
+        } else {
+            result += text.slice_bytes(i, 1_usize)
+        }
+    }
+    ret result + "\""
+}
+
+struct SourceLocation {
+    function_line: usize
+    line: usize
+    variable: str
+    type_name: str
+    width: usize
+    encoding: str
+    argument: usize
+}
+
+fn scalar_type(name: str) ->(usize, str) {
+    ret match name {
+        "bool" =>(1_usize, "DW_ATE_boolean")
+        "u8" =>(8_usize, "DW_ATE_unsigned")
+        "u16" =>(16_usize, "DW_ATE_unsigned")
+        "u32" =>(32_usize, "DW_ATE_unsigned")
+        "u64" =>(64_usize, "DW_ATE_unsigned")
+        "usize" =>(64_usize, "DW_ATE_unsigned")
+        "i8" =>(8_usize, "DW_ATE_signed")
+        "i16" =>(16_usize, "DW_ATE_signed")
+        "i32" =>(32_usize, "DW_ATE_signed")
+        "i64" =>(64_usize, "DW_ATE_signed")
+        "isize" =>(64_usize, "DW_ATE_signed")
+        _ =>(0_usize, "")
+    }
+}
+
+fn source_location(text: str, function_line: usize, line: usize) -> SourceLocation {
+    let colon = text.find_byte_from(58_u8, 0_usize)
+    let equal = text.find_byte_from(61_u8, 0_usize)
+    if colon < equal && equal < text.byte_len() {
+        let name = trim(text.slice_bytes(0_usize, colon))
+        let type_name = trim(text.slice_bytes(colon + 1_usize, equal - colon - 1_usize))
+        let typ = scalar_type(type_name)
+        ret SourceLocation { function_line, line, name, type_name, typ.0, typ.1, 0_usize }
+    }
+    ret SourceLocation { function_line, line, "", "", 0_usize, "", 0_usize }
+}
+
+fn function_arguments(header: str, line: usize) -> Vec[SourceLocation] {
+    let mut result = Vec[SourceLocation]::new()
+    let start = header.find_byte_from(40_u8, 0_usize) + 1_usize
+    let end = header.find_byte_from(41_u8, start)
+    if end == header.byte_len() {
+        ret result
+    }
+    let mut item = start
+    let mut nesting = 0_usize
+    let mut index = 1_usize
+    for i in start..(end + 1_usize) {
+        let b = header.byte_at(i)
+        if b == 91_u8 {
+            nesting += 1_usize
+        }
+        if b == 93_u8 && nesting > 0_usize {
+            nesting -= 1_usize
+        }
+        if (b == 44_u8 && nesting == 0_usize) || i == end {
+            let mut argument = source_location(header.slice_bytes(item, i - item) + " =", line, line)
+            argument.argument = index
+            if argument.width != 0_usize {
+                result.push(argument)
+            }
+            item = i + 1_usize
+            index += 1_usize
+        }
+    }
+    ret result
+}
+
+fn add_marker(locations: mut Vec[SourceLocation], declarations: mut Vec[Directive], source: SourceLocation) -> str {
+    let index = Debug::fmt(locations.len())
+    let name = "__ehir_debug_location_" + index
+    let mut params = Vec[Parameter]::new()
+    let argument = if source.width != 0_usize {
+        params.push(param("value", plain_type(source.type_name, Vec[Type]::new())))
+        source.variable + ": " + source.type_name
+    } else {
+        ""
+    }
+    declarations.push(Directive::Function(extern_fn_item(name, Vec[Type]::new(), params, plain_type("void", Vec[Type]::new()))))
+    locations.push(source)
+    ret "  __ehir_debug_unused_" + index + ": void = call " + name + "(" + argument + ")\n"
+}
+
+// Temporary extern calls survive CFG and coroutine lowering. The adapter
+// removes them before assembly, substituting real LLVM debug locations.
+fn instrument(source: str) ->(str, Vec[SourceLocation], Vec[Directive]) {
+    let mut result = ""
+    let mut locations = Vec[SourceLocation]::new()
+    let mut declarations = Vec[Directive]::new()
+    let mut line = 0_usize
+    let mut function_line = 0_usize
+    let mut in_block = false
+    let mut in_table = false
+    let mut resumable = false
+    let mut pending = Vec[SourceLocation]::new()
+    for original in lines(source) {
+        line += 1_usize
+        let text = trim(original)
+        if in_table {
+            if text == "}" {
+                in_table = false
+            }
+        } elif prefix(text, "fn ") || prefix(text, "generator fn ") || prefix(text, "async fn ") {
+            function_line = line
+            in_block = false
+            resumable = !prefix(text, "fn ")
+            pending = if resumable {
+                Vec[SourceLocation]::new()
+            } else {
+                function_arguments(text, line)
+            }
+        } elif prefix(text, "$") {
+            in_block = function_line != 0_usize
+        } elif text == "}" {
+            in_block = false
+            function_line = 0_usize
+        } elif in_block && text != "" && !prefix(text, ";") && !prefix(text, "//") {
+            let equal = text.find_byte_from(61_u8, 0_usize)
+            let body = if equal < text.byte_len() {
+                trim(text.slice_bytes(equal + 1_usize, text.byte_len() - equal - 1_usize))
+            } else {
+                text
+            }
+            let location = source_location(text, function_line, line)
+            if prefix(body, "phi ") {
+                // Keep the original phi group at the beginning of its block.
+                if !resumable && location.width != 0_usize {
+                    pending.push(location)
+                }
+            } else {
+                for value in pending {
+                    result += add_marker(locations, declarations, value)
+                }
+                pending = Vec[SourceLocation]::new()
+                result += add_marker(locations, declarations, source_location("", function_line, line))
+                result += original + "\n"
+                if !resumable && location.width != 0_usize {
+                    result += add_marker(locations, declarations, location)
+                }
+                in_table = prefix(text, "match ") || prefix(text, "switch ")
+                continue
+            }
+        }
+        result += original + "\n"
+    }
+    ret(result, locations, declarations)
+}
+
+struct Metadata {
+    records: Vec[str]
+}
+
+fn append_metadata(meta: mut Metadata, content: str) -> str {
+    let id = Debug::fmt(meta.records.len())
+    meta.records.push("!" + id + " = " + content + "\n")
+    ret "!" + id
+}
+
+fn marker_index(text: str) -> Option[usize] {
+    if !prefix(text, "call void ") && !prefix(text, "declare void ") {
+        ret Option[usize]::None
+    }
+    let marker = "@__ehir_debug_location_"
+    let start = text.find_from(marker, 0_usize)
+    if start >= text.byte_len() {
+        ret Option[usize]::None
+    }
+    let mut i = start + marker.byte_len()
+    let mut result = 0_usize
+    let digits = i
+    while i < text.byte_len() {
+        let b = text.byte_at(i)
+        if b < 48_u8 || b > 57_u8 {
+            break
+        }
+        result = result * 10_usize +(b - 48_u8) as usize
+        i += 1_usize
+    }
+    ret if i == digits {
+        Option[usize]::None
+    } else {
+        Option[usize]::Some(result)
+    }
+}
+
+fn emit_metadata(ir: str, path: str, locations: Vec[SourceLocation]) -> str {
+    let mut meta = Metadata { Vec[str]::new() }
+    let file = append_metadata(meta, "!DIFile(filename: " + quote(path) + ", directory: \"\")")
+    let cu = append_metadata(meta, "distinct !DICompileUnit(language: DW_LANG_C, file: " + file + ", producer: \"ehir-dbg\", isOptimized: false, runtimeVersion: 0, emissionKind: FullDebug)")
+    let types = append_metadata(meta, "!{null}")
+    let function_type = append_metadata(meta, "!DISubroutineType(types: " + types + ")")
+    let version = append_metadata(meta, "!{i32 2, !\"Debug Info Version\", i32 3}")
+    let dwarf = append_metadata(meta, "!{i32 2, !\"Dwarf Version\", i32 4}")
+    let mut output = ""
+    let mut header = ""
+    let mut function_body = ""
+    let mut variables = ""
+    let mut function_scope = ""
+    let mut location = ""
+    let mut in_switch = false
+    for line in lines(ir) {
+        let text = trim(line)
+        if prefix(text, "define ") {
+            header = line
+            function_body = ""
+            variables = ""
+            function_scope = ""
+            location = ""
+            in_switch = false
+            continue
+        }
+        match marker_index(text) {
+            Some(index) => {
+                if header != "" && !prefix(text, "declare ") {
+                    let source = locations.get_unchecked_borrowed(index)
+                    if function_scope == "" {
+                        let start = header.find_byte_from(64_u8, 0_usize) + 1_usize
+                        let end = header.find_byte_from(40_u8, start)
+                        let name = header.slice_bytes(start, end - start)
+                        let definition_line = Debug::fmt(source.function_line)
+                        function_scope = append_metadata(meta, "distinct !DISubprogram(name: " + quote(name) +
+                            ", file: " + file + ", scope: " + file + ", line: " + definition_line +
+                            ", scopeLine: " + definition_line + ", type: " + function_type + ", spFlags: DISPFlagDefinition, unit: " + cu + ")",)
+                    }
+                    location = append_metadata(meta, "!DILocation(line: " + Debug::fmt(source.line) + ", column: 1, scope: " + function_scope + ")")
+                    if source.width != 0_usize {
+                        let start = text.find_byte_from(40_u8, text.find_from("@__ehir_debug_location_", 0_usize)) + 1_usize
+                        let end = text.find_byte_from(41_u8, start)
+                        let argument = text.slice_bytes(start, end - start)
+                        let operand_start = argument.find_byte_from(32_u8, 0_usize) + 1_usize
+                        let mut operand = argument.slice_bytes(operand_start, argument.byte_len() - operand_start)
+                        if prefix(operand, "zeroext ") {
+                            operand = operand.slice_bytes(8_usize, operand.byte_len() - 8_usize)
+                        }
+                        if prefix(operand, "signext ") {
+                            operand = operand.slice_bytes(8_usize, operand.byte_len() - 8_usize)
+                        }
+                        let storage_type = "i" + Debug::fmt(source.width)
+                        let storage = "%__ehir_debug_slot_" + Debug::fmt(index)
+                        variables += "  " + storage + " = alloca " + storage_type + "\n"
+                        let typ = append_metadata(meta, "!DIBasicType(name: " + quote(source.type_name) + ", size: " +
+                            Debug::fmt(source.width) + ", encoding: " + source.encoding + ")",)
+                        let arg = if source.argument == 0_usize {
+                            ""
+                        } else {
+                            ", arg: " + Debug::fmt(source.argument)
+                        }
+                        let local = append_metadata(meta, "!DILocalVariable(name: " + quote(source.variable) + arg + ", scope: " + function_scope +
+                            ", file: " + file + ", line: " + Debug::fmt(source.line) + ", type: " + typ + ")",)
+                        function_body += "  store " + storage_type + " " + operand + ", ptr " + storage + ", !dbg " + location + "\n" +
+                        "  call void @llvm.dbg.declare(metadata ptr " + storage +
+                        ", metadata " + local + ", metadata !DIExpression()), !dbg " + location + "\n"
+                    }
+                }
+                continue
+            }
+            None => {
+            }
+        }
+        if header == "" {
+            output += line + "\n"
+        } elif text == "}" {
+            if function_scope == "" {
+                output += header + "\n"
+            } else {
+                let end = header.byte_len() - 1_usize
+                output += header.slice_bytes(0_usize, end) + "!dbg " + function_scope + " {\n"
+            }
+            // Put slots in the entry block, including values defined in loops.
+            let entry = function_body.find_from(":\n", 0_usize) + 2_usize
+            if variables != "" && entry <= function_body.byte_len() {
+                output += function_body.slice_bytes(0_usize, entry) + variables +
+                function_body.slice_bytes(entry, function_body.byte_len() - entry)
+            } else {
+                output += function_body
+            }
+            output += line + "\n"
+            header = ""
+        } elif text.byte_len() != 0_usize && text.byte_at(text.byte_len() - 1_usize) == 58_u8 {
+            location = ""
+            function_body += line + "\n"
+        } elif prefix(text, "switch ") {
+            in_switch = true
+            function_body += line + "\n"
+        } elif in_switch {
+            if text == "]" {
+                function_body += line +(if location == "" {
+                        ""
+                    } else {
+                        ", !dbg " + location
+                    }
+                ) + "\n"
+                in_switch = false
+            } else {
+                function_body += line + "\n"
+            }
+        } elif location != "" && text != "" && !prefix(text, ";") {
+            function_body += line + ", !dbg " + location + "\n"
+        } else {
+            function_body += line + "\n"
+        }
+    }
+    output += "\ndeclare void @llvm.dbg.declare(metadata, metadata, metadata)\n"
+    output += "!llvm.dbg.cu = !{" + cu + "}\n!llvm.module.flags = !{" + version + ", " + dwarf + "}\n"
+    for record in meta.records {
+        output += record
+    }
+    ret output
+}
+
+pub fn debug_ir(source: str, path: str, triple: str) -> Result[str, str] {
+    if source.contains("__ehir_debug_location_") || source.contains("__ehir_debug_unused_") || source.contains("__ehir_debug_slot_") {
+        ret Result::Err("input contains a reserved debug symbol")
+    }
+    let program = instrument(source)
+    let text = trim(program.0)
+    let wrapped = if prefix(text, "module ") || prefix(text, "entry ") {
+        text
+    } else {
+        "module input {\n" + text + "\n}\n"
+    }
+    let parsed = flatten_module_bundle("input", try_parse_module_bundle_text("input", wrapped)?)
+    let mut directives = parsed.directives
+    directives.extend(program.2)
+    clear_codegen_error()
+    let ir = emit_ir_for_target(make_module("input", directives), triple, 64_usize)
+    let error = take_codegen_error()
+    if error != "" {
+        ret Result::Err(error)
+    }
+    ret Result::Ok(emit_metadata(ir, path, program.1))
+}

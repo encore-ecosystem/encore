@@ -18,9 +18,10 @@ PACKAGES = (
     "core", "platform", "std", "rich", "serialize", "json", "binary", "log",
     "profile", "ehir-core", "ehir", "ehir-llvm-backend", "toml",
     "llvm", "argparse", "secret-store",
-    "network", "ipc", "asyncio",
+    "network", "ipc", "asyncio", "ehir-interpret", "ehir-dbg",
 )
-IN_TREE_PACKAGES = frozenset(("network", "ipc", "asyncio"))
+EHIR_TOOLS = frozenset(("ehir-interpret", "ehir-dbg"))
+IN_TREE_PACKAGES = frozenset(("network", "ipc", "asyncio")) | EHIR_TOOLS
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -117,6 +118,9 @@ def sdk_manifest(root: Path, ref: str = "HEAD", verify_checkout: bool = False,
                  packages: tuple[str, ...] = PACKAGES) -> dict:
     pinned = links(root, ref)
     urls = module_urls(root, ref)
+    version = tomllib.loads(git(root, "show", f"{ref}:encore.toml").decode("utf-8"))["project"]["version"]
+    if tuple(map(int, version.split("."))) < (0, 1, 18):
+        packages = tuple(folder for folder in packages if folder not in EHIR_TOOLS)
     rows = []
     for folder in packages:
         path = f"packages/{folder}"
@@ -249,7 +253,8 @@ def main() -> int:
             export_package(root, args.ref, args.package, args.destination)
         elif args.action == "export-sdk":
             value = sdk_manifest(root, args.ref, verify_checkout=True)
-            for folder in PACKAGES:
+            for entry in value["packages"]:
+                folder = PurePosixPath(entry["path"]).name
                 export_package(root, args.ref, folder, args.destination / folder)
             args.manifest.parent.mkdir(parents=True, exist_ok=True)
             args.manifest.write_bytes(manifest_bytes(value))
