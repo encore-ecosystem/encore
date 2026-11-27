@@ -7,10 +7,10 @@ with `encore build`, and use `CC` to select Clang if needed.
 From the repository root, build a small EHIR program with debug information.
 
 ```sh
-(cd packages/ehir-dbg && encore build)
+(cd bytecode/ehir-dbg && encore build)
 mkdir -p target/ehir-debug
-packages/ehir-dbg/target/dev/ehir-dbg \
-  packages/ehir-interpret/tests/fixtures/values.ehir -o target/ehir-debug/values.o
+bytecode/ehir-dbg/target/dev/ehir-dbg \
+  bytecode/ehir-interpret/tests/fixtures/values.ehir -o target/ehir-debug/values.o
 clang -g target/ehir-debug/values.o -o target/ehir-debug/values
 lldb target/ehir-debug/values
 ```

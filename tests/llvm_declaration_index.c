@@ -1,7 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <pthread.h>
-#include "../packages/ehir-llvm-backend/runtime_ir.h"
+#include "../bytecode/ehir-llvm-backend/runtime_ir.h"
 
 static const char declarations[] =
     "%A = type { %B* }\n%B = type { %A*, i32 }\n%Dead = type { i64 }\n"

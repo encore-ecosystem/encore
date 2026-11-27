@@ -21,6 +21,7 @@ PACKAGES = (
     "network", "ipc", "asyncio", "ehir-interpret", "ehir-dbg",
 )
 EHIR_TOOLS = frozenset(("ehir-interpret", "ehir-dbg"))
+BYTECODE_PACKAGES = frozenset(("ehir", "ehir-core", "ehir-llvm-backend")) | EHIR_TOOLS
 IN_TREE_PACKAGES = frozenset(("network", "ipc", "asyncio")) | EHIR_TOOLS
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,17 +58,22 @@ def module_urls(root: Path, ref: str) -> dict[str, str]:
     return result
 
 
-def repository_for_link(root: Path, path: str, commit: str) -> Path:
-    repository = root / path
-    try:
-        actual = Path(os.fsdecode(git(repository, "rev-parse", "--show-toplevel")).strip()).resolve()
-        if actual != repository.resolve():
-            raise ValueError("not an initialized submodule")
-        git(repository, "cat-file", "-e", f"{commit}^{{commit}}")
-    except (OSError, ValueError) as error:
-        raise ValueError(f"SDK submodule {path} at {commit} is unavailable; run "
-                         "git submodule update --init --recursive") from error
-    return repository
+def repository_for_link(root: Path, path: str, commit: str, allow_moved: bool = True) -> Path:
+    candidates = [root / path]
+    folder = PurePosixPath(path).name
+    if allow_moved and folder in BYTECODE_PACKAGES:
+        other_dir = "packages" if path.startswith("bytecode/") else "bytecode"
+        candidates.append(root / other_dir / folder)
+    for repository in candidates:
+        try:
+            actual = Path(os.fsdecode(git(repository, "rev-parse", "--show-toplevel")).strip()).resolve()
+            if actual == repository.resolve():
+                git(repository, "cat-file", "-e", f"{commit}^{{commit}}")
+                return repository
+        except (OSError, ValueError):
+            continue
+    raise ValueError(f"SDK submodule {path} at {commit} is unavailable; run "
+                     "git submodule update --init --recursive")
 
 
 def _child_paths(path: str, selected: tuple[str, ...]) -> tuple[str, ...] | None:
@@ -103,10 +109,17 @@ def export_tree(root: Path, ref: str, destination: Path, paths: tuple[str, ...] 
         export_tree(child, commit, destination / path, selected)
 
 
-def export_package(root: Path, ref: str, folder: str, destination: Path) -> None:
+def package_path(root: Path, ref: str, folder: str) -> str:
     if folder not in PACKAGES:
         raise ValueError(f"unknown SDK package: {folder}")
-    path = f"packages/{folder}"
+    moved = f"bytecode/{folder}"
+    if folder in BYTECODE_PACKAGES and git(root, "ls-tree", "--name-only", ref, "--", moved):
+        return moved
+    return f"packages/{folder}"
+
+
+def export_package(root: Path, ref: str, folder: str, destination: Path) -> None:
+    path = package_path(root, ref, folder)
     pinned = links(root, ref).get(path)
     if pinned:
         export_tree(repository_for_link(root, path, pinned), pinned, destination)
@@ -123,7 +136,7 @@ def sdk_manifest(root: Path, ref: str = "HEAD", verify_checkout: bool = False,
         packages = tuple(folder for folder in packages if folder not in EHIR_TOOLS)
     rows = []
     for folder in packages:
-        path = f"packages/{folder}"
+        path = package_path(root, ref, folder)
         if folder in IN_TREE_PACKAGES:
             tree = git(root, "rev-parse", f"{ref}:{path}").decode("ascii").strip()
             manifest = tomllib.loads(git(root, "show", f"{tree}:encore.toml").decode("utf-8"))["project"]
@@ -135,7 +148,7 @@ def sdk_manifest(root: Path, ref: str = "HEAD", verify_checkout: bool = False,
         if path not in pinned or path not in urls:
             raise ValueError(f"expected a pinned SDK submodule: {path}")
         commit = pinned[path]
-        repository = repository_for_link(root, path, commit)
+        repository = repository_for_link(root, path, commit, allow_moved=not verify_checkout)
         manifest = tomllib.loads(git(repository, "show", f"{commit}:encore.toml").decode("utf-8"))["project"]
         if verify_checkout:
             actual = git(repository, "rev-parse", "HEAD").decode("ascii").strip()
@@ -145,7 +158,7 @@ def sdk_manifest(root: Path, ref: str = "HEAD", verify_checkout: bool = False,
                 raise ValueError(f"SDK package has tracked changes: {path}")
         rows.append({"path": path, "repository": urls[path], "commit": commit,
                      "name": manifest["name"], "version": manifest["version"]})
-    if set(pinned) != {f"packages/{folder}" for folder in packages if folder not in IN_TREE_PACKAGES}:
+    if set(pinned) != {row["path"] for row in rows if "commit" in row}:
         raise ValueError("unexpected or missing SDK submodule in the parent tree")
     return {"schema": 1, "packages": rows}
 
@@ -170,7 +183,8 @@ def working_tree_files(root: Path) -> list[str]:
     out = {name for name in names if name and (root / name).is_file()}
     for path, commit in links(root, "HEAD").items():
         child = repository_for_link(root, path, commit)
-        out.update(f"{path}/{name}" for name in working_tree_files(child))
+        prefix = child.relative_to(root).as_posix()
+        out.update(f"{prefix}/{name}" for name in working_tree_files(child))
     return sorted(out)
 
 
@@ -181,6 +195,16 @@ def copy_working_tree(root: Path, destination: Path) -> list[str]:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / name, target)
     return names
+
+
+def installed_sdk_file(source_path: str, filename: str, content: bytes) -> bytes:
+    if source_path.startswith("bytecode/") and filename == "encore.toml":
+        # The release index installs bytecode and system packages as siblings.
+        for dependency in ("std", "binary", "llvm"):
+            content = content.replace(
+                f'"path@../../packages/{dependency}"'.encode(), f'"path@../{dependency}"'.encode()
+            )
+    return content
 
 
 def check_sdk_archive(archive: Path, prefix: str, manifest: dict, root: Path | None = None, ref: str = "HEAD") -> None:
@@ -213,7 +237,10 @@ def check_sdk_archive(archive: Path, prefix: str, manifest: dict, root: Path | N
                 object_id = package["commit"]
                 repository = repository_for_link(root, package["path"], object_id)
             with tarfile.open(fileobj=io.BytesIO(git(repository, "-c", "core.autocrlf=false", "-c", "core.eol=lf", "archive", "--format=tar", object_id))) as source:
-                expected = {item.name: source.extractfile(item).read() for item in source.getmembers() if item.isfile()}
+                expected = {
+                    item.name: installed_sdk_file(package["path"], item.name, source.extractfile(item).read())
+                    for item in source.getmembers() if item.isfile()
+                }
             package_prefix = f"{prefix}/lib/encore/index/{folder}/"
             actual = {name[len(package_prefix):]: data for name, data in files.items() if name.startswith(package_prefix)}
             if actual != expected:
@@ -255,7 +282,13 @@ def main() -> int:
             value = sdk_manifest(root, args.ref, verify_checkout=True)
             for entry in value["packages"]:
                 folder = PurePosixPath(entry["path"]).name
-                export_package(root, args.ref, folder, args.destination / folder)
+                destination = args.destination / folder
+                export_package(root, args.ref, folder, destination)
+                if entry["path"].startswith("bytecode/"):
+                    manifest_path = destination / "encore.toml"
+                    manifest_path.write_bytes(installed_sdk_file(
+                        entry["path"], manifest_path.name, manifest_path.read_bytes()
+                    ))
             args.manifest.parent.mkdir(parents=True, exist_ok=True)
             args.manifest.write_bytes(manifest_bytes(value))
         elif args.action == "manifest":

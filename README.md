@@ -90,8 +90,8 @@ and release provenance. Release distributions contain ordinary SDK files and
 work without Git or an index connection.
 
 The SDK includes two standalone tools for typed EHIR. Use
-[ehir-interpret](packages/ehir-interpret/) to execute the synchronous subset
-and [ehir-dbg](packages/ehir-dbg/) to build native objects for LLDB or Zed.
+[ehir-interpret](bytecode/ehir-interpret/) to execute the synchronous subset
+and [ehir-dbg](bytecode/ehir-dbg/) to build native objects for LLDB or Zed.
 
 For the published `v0.1.5-neumann` seed, first fetch that Git tag and run
 `bash scripts/ci-seed-build.sh /path/to/0.1.5/bin/encore v0.1.5-neumann build --profile extreme`.

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "packages/ehir-interpret/tests/fixtures"
+FIXTURES = ROOT / "bytecode/ehir-interpret/tests/fixtures"
 CORE = ROOT / "packages/core"
 PROGRAMS = {
     "values": (42, ""),
@@ -39,7 +39,7 @@ def main():
         return result
 
     def build(package):
-        cwd = ROOT / "packages" / package
+        cwd = ROOT / "bytecode" / package
         run([args.compiler.resolve(), "build"], cwd=cwd)
         suffix = ".exe" if os.name == "nt" else ""
         return cwd / "target/dev" / (package + suffix)

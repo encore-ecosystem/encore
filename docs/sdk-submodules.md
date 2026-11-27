@@ -4,7 +4,7 @@ Encore pins 16 public package repositories in `.gitmodules`. The superproject's
 Git tree records the commit to use for each path. Builds never select a branch
 head or run `git submodule update --remote`.
 
-| SDK directory | Repository in encore-language-index |
+| SDK package | Repository in encore-language-index |
 | --- | --- |
 | core | core |
 | platform | platform |
@@ -25,6 +25,9 @@ head or run `git submodule update --remote`.
 
 These are the compiler's existing SDK packages. The independent `logger` and
 `profiler` packages retain their existing APIs and repositories.
+
+The EHIR submodules live under [`bytecode/`](../bytecode/). The remaining
+SDK submodules are under `packages/`.
 
 ## Checkout and package changes
 
@@ -65,6 +68,10 @@ native runtimes, build scripts and tests. Starting with 0.1.18, the in-tree
 packages include `ehir-interpret` and `ehir-dbg`. The `SDK.json` manifest
 records each package's directory, manifest identity and source Git object.
 Git metadata and build caches are excluded.
+
+The SDK exporter adjusts the bytecode packages' relative dependencies for
+the flat install layout. Archive verification applies the same mapping to the
+pinned manifests when it checks the installed files.
 
 CI tests the extracted compiler and bundled SDK outside the source checkout with
 empty build/registry caches and an unreachable registry. Both cold and warm
