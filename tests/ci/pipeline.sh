@@ -59,13 +59,13 @@ case "$CI_PROBE_CASE" in
       cp "$repository/scripts/project-metadata.py" "$repository/scripts/sdk_packages.py" "$workspace/scripts/"
       # Tracked in-tree packages need real files for checkout verification.
       # Submodule worktrees can be shared with the original checkout.
-      git -C "$workspace" restore --source=HEAD --staged --worktree -- packages
+      git -C "$workspace" restore --source=HEAD --staged --worktree -- packages bytecode
       while read -r mode kind object package; do
         if [[ "$kind" == commit ]]; then
           rmdir "$workspace/$package"
           ln -s "$repository/$package" "$workspace/$package"
         fi
-      done < <(git -C "$repository" ls-tree HEAD packages/)
+      done < <(git -C "$repository" ls-tree -r HEAD packages/ bytecode/)
       cp "$repository/src/version.enq" "$workspace/src/"
       cp "$repository/encore.toml" "$workspace/"
       cp "$repository/tests/ci/mock-compiler.sh" "$context/bin/encore"
@@ -169,6 +169,7 @@ case "$CI_PROBE_CASE" in
     fi
     ;;
   archive)
+    export COPYFILE_DISABLE=1
     release=0.1.4-neumann
     for triple in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
       root="encore-$release-$triple"

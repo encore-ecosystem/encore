@@ -23,7 +23,8 @@ cp tests/ci/build_scripts.enq "$fixture/src/ci_build_scripts.enq"
 cp tests/ci/runtime.c "$fixture/runtime.c"
 # Preserve source-relative package identities; do not expose CLI internals in
 # the compiler's public library merely to discover their private unit tests.
-sed 's|path@packages/|path@../../../packages/|g' encore.toml > "$fixture/encore.toml"
+sed -e 's|path@packages/|path@../../../packages/|g' \
+    -e 's|path@bytecode/|path@../../../bytecode/|g' encore.toml > "$fixture/encore.toml"
 export ENCORE_TEST_COMPILER="$compiler"
 export ENCORE_TEST_REPOSITORY="$repository"
 report="$repository/target/test-report.json"

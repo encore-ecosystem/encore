@@ -124,7 +124,7 @@ def main():
     (consumer / "src").mkdir(parents=True, exist_ok=True)
     (consumer / "encore.toml").write_text(
         '[project]\nname = "ehir_consumer"\nbinary-name = "library-client"\nversion = "0.0.0"\n'
-        f'dependencies = ["path@{ROOT / "packages/ehir"}", "path@{ROOT / "tests/fixtures/ehir-backend"}"]\n')
+        f'dependencies = ["path@{ROOT / "bytecode/ehir"}", "path@{ROOT / "tests/fixtures/ehir-backend"}"]\n')
     (consumer / "src/main.enq").write_text('''import ehirlib::{CompileOptions, compile_with_backend, parse_text}
 import inspection_backend::InspectionBackend
 struct Counter { value: u32 }

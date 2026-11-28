@@ -85,8 +85,10 @@ while read -r mode kind object path; do
   fi
 done < <(git ls-tree -r "$seed_tag" -- packages/core packages/platform packages/std packages/json)
 mkdir -p "$source_root"
-tar -cf - --exclude='packages/*/target' --exclude=.git \
-  src packages runtime runtime.c encore.toml README.md |
+sources=(src packages runtime runtime.c encore.toml README.md)
+if [[ -d bytecode ]]; then sources+=(bytecode); fi
+tar -cf - --exclude='packages/*/target' --exclude='bytecode/*/target' --exclude=.git \
+  "${sources[@]}" |
   tar -xf - -C "$source_root"
 for package in core platform std json; do
   rm -rf "$source_root/packages/$package"
