@@ -149,6 +149,12 @@ class SdkPackagesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tracked changes: packages/ipc"):
             sdk.sdk_manifest(self.root, packages=packages, verify_checkout=True)
 
+    def test_legacy_seed_manifest_does_not_require_standalone_http(self):
+        self.write(self.root, "encore.toml", b'[project]\nname="compiler"\nversion="0.1.17"\n')
+        self.commit(self.root)
+        manifest = sdk.sdk_manifest(self.root, packages=("core", "http"), verify_checkout=True)
+        self.assertEqual([row["path"] for row in manifest["packages"]], ["packages/core"])
+
     def test_nested_gitlinks_are_expanded_at_their_own_pins(self):
         nested = self.directory / "native helper"
         self.initialize(nested)

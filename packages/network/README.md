@@ -43,3 +43,9 @@ The native tests create disposable certificates, then exercise TCP/TLS, hostname
 verification, operation cancellation, accept/read deadlines, ordered writes,
 mailbox overflow, abandoned wakers and resource cleanup under ASan/UBSan.
 The suite runs locally and needs no external server or credentials.
+
+Relocatable macOS and Windows SDKs provide static OpenSSL and a CA bundle.
+`SSL_CERT_FILE`/`SSL_CERT_DIR` override default trust; a connection CA file takes
+precedence. Source builds fall back to the OpenSSL installation trust store.
+Operation futures own their native registrations across executor handoff and
+release unfinished operations on final drop.

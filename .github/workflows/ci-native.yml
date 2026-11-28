@@ -101,6 +101,51 @@ jobs:
             python3 scripts/test-node-runtime.py --cc "$node_cc" --sanitize
           fi
 
+      - uses: actions/download-artifact@v7
+        if: contains(inputs.triple, 'windows-gnu')
+        with:
+          name: windows-openssl-${{ inputs.triple }}
+          path: target/windows-openssl
+
+      - name: Build native Windows MSVC OpenSSL
+        if: contains(inputs.triple, 'windows-msvc')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $install = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$install) { throw 'Visual Studio C++ installation is required' }
+          $vars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
+          $environment = & $env:ComSpec /d /c "call `"$vars`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64.bat failed' }
+          foreach ($line in $environment) {
+            if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+          }
+          $perl = "$env:SystemDrive\Strawberry\perl\bin\perl.exe"
+          if (!(Test-Path $perl)) { $perl = (Get-Command perl.exe -CommandType Application).Source }
+          & $perl -MIPC::Cmd -e 1
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL requires a complete Windows Perl installation' }
+          $env:OPENSSL_PERL = $perl
+          & bash scripts/build-windows-openssl.sh '${{ inputs.triple }}' target/windows-openssl
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL build failed' }
+
+      - name: Select Windows OpenSSL for bootstrap
+        if: contains(inputs.triple, 'windows-')
+        shell: bash
+        run: printf 'OPENSSL_DIR=%s\n' "$(cygpath -m "$PWD/target/windows-openssl")" >> "$GITHUB_ENV"
+
+      - name: Build portable macOS OpenSSL
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash scripts/build-static-openssl.sh '${{ inputs.triple }}' target/native-openssl
+          printf 'OPENSSL_DIR=%s\n' "$PWD/target/native-openssl" >> "$GITHUB_ENV"
+
+      - name: Bundle native trust roots
+        if: runner.os != 'Linux'
+        shell: bash
+        run: python3 scripts/export-ca-bundle.py "$OPENSSL_DIR/cert.pem"
+
       - name: Build and verify isolated native stages
         shell: bash
         env:
@@ -117,6 +162,7 @@ jobs:
           mkdir -p "$context/bin"
           cp "target/stage3/${{ inputs.executable }}" "$context/bin/"
           cp target/convergence.json "$context/provenance.json"
+          if [[ '${{ inputs.triple }}' != *-linux-* ]]; then cp -R "$OPENSSL_DIR" "$context/openssl"; fi
 
       - uses: actions/upload-artifact@v7
         with:
@@ -153,7 +199,7 @@ jobs:
         run: |
           set -euo pipefail
           compiler="$PWD/target/stage3/${{ inputs.executable }}"
-          for package in packages/{core,platform,std,serialize,json,binary,toml} bytecode/{ehir-core,ehir,ehir-llvm-backend}; do
+          for package in packages/{core,platform,std,http,serialize,json,binary,toml} bytecode/{ehir-core,ehir,ehir-llvm-backend}; do
             (cd "$package" && "$compiler" test --report target/test-report.json)
           done
 
@@ -198,13 +244,20 @@ jobs:
           python3 scripts/generate-translation-environment-codec.py --check
           python3 scripts/generate-source-artifact-codec.py --check
 
+      - name: Verify programs have no implicit networking dependencies
+        shell: bash
+        run: python3 scripts/test-runtime-dependencies.py --compiler "target/stage3/${{ inputs.executable }}"
+
+      - name: Test HTTP and HTTPS clients
+        shell: bash
+        run: python3 scripts/test-http-async.py --compiler "target/stage3/${{ inputs.executable }}"
+
       - name: Test synchronization ownership and races
         if: inputs.triple == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           python3 scripts/test-sync-runtime.py
           python3 scripts/test-sync-runtime.py --sanitizer thread
-          python3 scripts/test-http-async.py --compiler target/stage3/encore
           python3 scripts/test-cache-lifecycle.py --compiler target/stage3/encore
 
       - name: Test concurrent LLVM declaration closure index
@@ -450,42 +503,14 @@ jobs:
             esac
           done
 
-      - uses: actions/download-artifact@v7
-        if: contains(inputs.triple, 'windows-gnu')
-        with:
-          name: windows-openssl-${{ inputs.triple }}
-          path: target/windows-openssl
-
-      - name: Build native Windows MSVC OpenSSL
-        if: contains(inputs.triple, 'windows-msvc')
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          $install = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (!$install) { throw 'Visual Studio C++ installation is required' }
-          $vars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
-          $environment = & $env:ComSpec /d /c "call `"$vars`" >nul && set"
-          if ($LASTEXITCODE -ne 0) { throw 'vcvars64.bat failed' }
-          foreach ($line in $environment) {
-            if ($line -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
-          }
-          $perl = "$env:SystemDrive\Strawberry\perl\bin\perl.exe"
-          if (!(Test-Path $perl)) { $perl = (Get-Command perl.exe -CommandType Application).Source }
-          & $perl -MIPC::Cmd -e 1
-          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL requires a complete Windows Perl installation' }
-          $env:OPENSSL_PERL = $perl
-          & bash scripts/build-windows-openssl.sh '${{ inputs.triple }}' target/windows-openssl
-          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL build failed' }
-
       - name: Test native TCP, TLS and local IPC
         shell: bash
         run: |
           set -euo pipefail
           export CC="${ENCORE_CC:-clang}"
           case '${{ inputs.triple }}' in
-            *-windows-*) export OPENSSL_DIR=$(cygpath -m "$PWD/target/windows-openssl") ;;
-            *-apple-darwin) export OPENSSL_DIR=$(brew --prefix openssl@3) ;;
+            *-windows-*) test -n "$OPENSSL_DIR" ;;
+            *-apple-darwin) test -n "$OPENSSL_DIR" ;;
           esac
           python3 packages/network/tests/run-native.py
 
@@ -510,7 +535,15 @@ jobs:
           python3 scripts/sdk_packages.py export-sdk --destination "$root/lib/encore/index" --manifest "$root/SDK.json"
           if [[ '${{ inputs.triple }}' == *-windows-* ]]; then
             mkdir -p "$root/lib/encore/index/openssl"
-            cp -R target/windows-openssl "$root/lib/encore/index/openssl/${{ inputs.triple }}"
+            cp -R "$OPENSSL_DIR" "$root/lib/encore/index/openssl/${{ inputs.triple }}"
+          fi
+          if [[ '${{ inputs.triple }}' == *-apple-darwin ]]; then
+            prefix="$root/lib/encore/index/openssl/${{ inputs.triple }}"
+            mkdir -p "$prefix/include" "$prefix/lib"
+            cp -RL "$OPENSSL_DIR/include/openssl" "$prefix/include/"
+            cp "$OPENSSL_DIR/lib/libssl.a" "$OPENSSL_DIR/lib/libcrypto.a" "$prefix/lib/"
+            cp "$OPENSSL_DIR/LICENSE.txt" "$OPENSSL_DIR/cert.pem" "$prefix/"
+            ! otool -L "$root/bin/encore" | grep -E '/(opt/homebrew|usr/local)/|lib(ssl|crypto)'
           fi
           cp LICENSE README.md "$root/share/doc/encore/"
           printf '%s\n' "$release" > "$root/VERSION"

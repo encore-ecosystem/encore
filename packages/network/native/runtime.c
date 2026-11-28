@@ -49,6 +49,7 @@ typedef struct { mf_str_object *object; } mf_str;
 extern mf_str encore_from_owned_buffer(char *, size_t);
 extern mf_str encore_from_cstr_copy(const char *);
 extern void encore_async_waker_wake(size_t);
+extern size_t encore_sync_box_new(size_t, size_t);
 extern bool encore_async_register_waker_cleanup(void (*)(size_t));
 static size_t slen(mf_str s) { return s.object ? s.object->len : 0; }
 static const char *sdata(mf_str s) { return s.object ? s.object->data : ""; }
@@ -74,7 +75,7 @@ struct endpoint {
     HANDLE pipe;
     wchar_t pipe_name[ENCORE_PIPE_NAME_CAPACITY];
 #endif
- size_t id, refs, group; int fd; bool closed, listener, local; SSL_CTX *ctx; SSL *ssl; char *state[16]; size_t state_length[16], flags[16]; bool mailbox, finished; size_t capacity, queued_count, queued_bytes; message *first, *last; endpoint *next; };
+ size_t id, refs, group; int fd; bool closed, listener, local; SSL_CTX *ctx; SSL *ssl; char *state[16]; size_t state_length[16], flags[16]; bool mailbox, finished, scope; size_t capacity, queued_count, queued_bytes; message *first, *last; endpoint *next; };
 struct operation {
 #ifdef _WIN32
     EncorePipeOperation pipe_operation;
@@ -85,7 +86,7 @@ struct operation {
 
     size_t id, endpoint_id, result_id, waker, owner, group;
     int kind, status, stage, dns; short interest;
-    uint64_t deadline; bool released, cancelled;
+    uint64_t deadline; bool released, cancelled, managed;
     char *host, *ca, *cert, *key, *bytes; size_t length, offset;
     unsigned port; bool tls; char error[256];
     struct addrinfo *addresses, *current;
@@ -132,6 +133,7 @@ static void drain_wakeup(void) {
 static endpoint *find_ep(size_t id) { for(endpoint *e=endpoints;e;e=e->next) if(e->id==id) return e; return NULL; }
 static operation *find_op(size_t id) { for(operation *o=operations;o;o=o->next) if(o->id==id && !o->released) return o; return NULL; }
 static void close_ep(endpoint *e) { if(!e || e->closed) return; e->closed=true;
+    if(e->scope && e->group) { endpoint *parent=find_ep(e->group); if(parent && parent->queued_count) parent->queued_count--; }
 #ifdef _WIN32
     if (e->pipe) { CloseHandle(e->pipe); e->pipe = NULL; }
 #endif
@@ -522,7 +524,7 @@ static void *reactor(void *unused) {
             at=&o->next;
         }
         endpoint **ep=&endpoints;
-        while(*ep) { endpoint *e=*ep; if(e->closed && !e->refs) { *ep=e->next; if(e->ssl) SSL_free(e->ssl); if(e->ctx) SSL_CTX_free(e->ctx); for(size_t i=0;i<16;i++) free(e->state[i]); while(e->first) { message *m=e->first; e->first=m->next; free(m->bytes); free(m); } free(e); } else ep=&e->next; }
+        while(*ep) { endpoint *e=*ep; if(e->closed && !e->refs) { *ep=e->next; if(e->ssl) SSL_free(e->ssl); if(e->ctx) SSL_CTX_free(e->ctx); for(size_t i=0;i<16;i++) free(e->state[i]); while(e->first) { message *m=e->first; e->first=m->next; free(m->bytes); free(m); } if(e->scope && e->group) { endpoint *parent=find_ep(e->group); if(parent && parent->refs) parent->refs--; } free(e); } else ep=&e->next; }
         pthread_mutex_unlock(&mu);
 #ifdef _WIN32
         fds[0]=(struct pollfd){0,0,0};
@@ -565,7 +567,7 @@ static void *dns_worker(void *unused) {
 }
 static void cleanup_waker(size_t w) {
     pthread_mutex_lock(&mu);
-    for(operation *o=operations;o;o=o->next) if(o->owner==w) { o->waker=0; o->owner=0; o->cancelled=true; o->released=true; if(o->group) close_ep(o->ep); }
+    for(operation *o=operations;o;o=o->next) if(o->owner==w) { o->waker=0; o->owner=0; if(o->managed) continue; o->cancelled=true; o->released=true; if(o->group) close_ep(o->ep); }
     pthread_mutex_unlock(&mu); notify();
 }
 static void initialize(void) {
@@ -684,4 +686,69 @@ void mfnet_operation_group(size_t id,size_t group) {
    if(!g || g->closed || !g->mailbox) { close_ep(o->ep); close_ep(result); done(o,3,"operation group is closed"); }
  }
  pthread_mutex_unlock(&mu); notify();
+}
+
+/* Owned operations survive executor handoff. Wakers are notifications; only
+ * final lease release cancels a managed operation. Never run a lease destructor
+ * while holding mu: platform ownership callbacks may reenter this runtime. */
+static void mfnet_drop_operation(size_t id) {
+    pthread_mutex_lock(&mu);
+    operation *o=find_op(id);
+    if(o) {
+        o->waker=0; o->owner=0; o->cancelled=true; o->released=true;
+        close_ep(find_ep(o->result_id));
+        // An abandoned connect owns its socket; a partially written stream
+        // cannot be reused without corrupting its protocol framing.
+        if(o->group || o->kind==1 || o->kind==LOCAL_CONNECT || (o->kind==3 && !o->status)) close_ep(o->ep);
+    }
+    pthread_mutex_unlock(&mu); notify();
+}
+size_t mfnet_operation_lease(size_t id) {
+    pthread_mutex_lock(&mu);
+    operation *o=find_op(id);
+    if(o) o->managed=true;
+    pthread_mutex_unlock(&mu);
+    if(!o) return 0;
+    size_t lease=encore_sync_box_new(id,(size_t)(uintptr_t)mfnet_drop_operation);
+    if(!lease) mfnet_drop_operation(id);
+    return lease;
+}
+size_t mfnet_scope_new(size_t parent, size_t capacity) {
+    pthread_once(&once,initialize);
+    if(init_error || !capacity || capacity>1024) return 0;
+    pthread_mutex_lock(&mu);
+    endpoint *p=find_ep(parent), *e=NULL;
+    if(!parent || (p && p->scope && !p->closed && p->queued_count<p->capacity)) {
+        e=new_ep(-1,false);
+        if(e) {
+            e->scope=true; e->mailbox=true; e->capacity=capacity; e->group=parent;
+            if(p) { p->queued_count++; p->refs++; }
+        }
+    }
+    size_t id=e?e->id:0;
+    pthread_mutex_unlock(&mu); return id;
+}
+static void mfnet_drop_scope(size_t id) {
+    pthread_mutex_lock(&mu);
+    endpoint *e=find_ep(id);
+    if(e) { close_ep(e); if(e->refs) e->refs--; }
+    pthread_mutex_unlock(&mu); notify();
+}
+size_t mfnet_scope_lease(size_t id) {
+    pthread_mutex_lock(&mu);
+    endpoint *e=find_ep(id);
+    if(e) e->refs++;
+    pthread_mutex_unlock(&mu);
+    if(!e) return 0;
+    size_t lease=encore_sync_box_new(id,(size_t)(uintptr_t)mfnet_drop_scope);
+    if(!lease) mfnet_drop_scope(id);
+    return lease;
+}
+bool mfnet_scope_closed(size_t id) {
+    pthread_mutex_lock(&mu); endpoint *e=find_ep(id);
+    bool closed=!e || e->closed; pthread_mutex_unlock(&mu); return closed;
+}
+bool mfnet_scope_close(size_t id) {
+    pthread_mutex_lock(&mu); endpoint *e=find_ep(id);
+    bool changed=e && !e->closed; close_ep(e); pthread_mutex_unlock(&mu); notify(); return changed;
 }

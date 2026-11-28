@@ -2,10 +2,9 @@
 
 Encore is a self-hosted native programming language built on EHIR and LLVM
 
-This local working tree includes standard HTTP runtime integration. Linux
-builds require OpenSSL and c-ares >=1.34 development headers and libraries;
-cross-build sysroots need those libraries too. This change is not an official
-compiler release.
+TCP/TLS lives in the `network` package; HTTP clients live in `http`.
+Basic `core`, `platform` and `std` programs require neither OpenSSL nor c-ares.
+Network consumers use OpenSSL 3; macOS and Windows SDKs bundle static archives.
 
 ## Install
 

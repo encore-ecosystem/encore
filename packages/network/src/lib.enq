@@ -4,6 +4,9 @@ import core::ops::ContextManager
 import core::result::Result
 
 import std::future::block_on
+import std::os::{core_dir, env, file_exists}
+import std::path::Path
+import std::sync::__ownership::{__Lease, __adopt, __empty}
 
 extern fn mfnet_endpoint_operation(kind: i32, host: str, port: usize, tls: bool, ca: str, cert: str, key: str, timeout: usize) -> usize
 extern fn mfnet_local_operation(kind: i32, path: str, timeout: usize) -> usize
@@ -12,6 +15,7 @@ extern fn mfnet_status(id: usize, waker: usize) -> i32
 extern fn mfnet_data(id: usize) -> str
 extern fn mfnet_error(id: usize) -> str
 extern fn mfnet_result_handle(id: usize) -> usize
+extern fn mfnet_operation_lease(id: usize) -> usize
 extern fn mfnet_release(id: usize)
 extern fn mfnet_operation_group(id: usize, group: usize)
 extern fn mfnet_cancel(id: usize)
@@ -75,23 +79,29 @@ pub struct OperationFuture {
     key: str
     operation: usize
     group: usize
+    ownership: __Lease
 }
 
 impl for OperationFuture {
     pub fn io(kind: i32, endpoint: usize, bytes: str, size: usize, timeout_ms: usize) -> Self {
         ret Self {
-            kind, endpoint, bytes, size, timeout_ms, "", 0_usize, false, "", "", "", 0_usize, 0_usize
+            kind, endpoint, bytes, size, timeout_ms, "", 0_usize, false, "", "", "", 0_usize, 0_usize, __empty()
         }
     }
     pub fn endpoint(kind: i32, host: str, port: usize, tls: bool, ca: str, cert: str, key: str, timeout_ms: usize) -> Self {
+        let ca = if kind == 1_i32 && tls && ca == "" {
+            default_ca_file()
+        } else {
+            ca
+        }
         ret Self {
-            kind, 0_usize, "", 0_usize, timeout_ms, host, port, tls, ca, cert, key, 0_usize, 0_usize
+            kind, 0_usize, "", 0_usize, timeout_ms, host, port, tls, ca, cert, key, 0_usize, 0_usize, __empty()
         }
     }
     /// Associate the operation and resulting stream with a Mailbox lifetime.
     pub fn in_group(self: Self, group: usize) -> Self {
         ret Self {
-            self.kind, self.endpoint, self.bytes, self.size, self.timeout_ms, self.host, self.port, self.tls, self.ca, self.cert, self.key, self.operation, group
+            self.kind, self.endpoint, self.bytes, self.size, self.timeout_ms, self.host, self.port, self.tls, self.ca, self.cert, self.key, self.operation, group, self.ownership
         }
     }
     #attr(safe)
@@ -123,6 +133,16 @@ impl Future[Result[OperationResult, NetworkError]] for OperationFuture {
                             ErrorKind::Capacity, "invalid configuration, concurrent operation, or network capacity exhausted"
                         }
                     ))
+            }
+            if state.ownership.raw() == 0_usize {
+                let lease = mfnet_operation_lease(state.operation)
+                if lease == 0_usize {
+                    ret Poll::Ready(Result::Err(NetworkError {
+                                ErrorKind::Capacity, "cannot own network operation"
+                            }
+                        ))
+                }
+                state.ownership = __adopt(lease)
             }
             if state.group != 0_usize {
                 mfnet_operation_group(state.operation, state.group)
@@ -514,4 +534,72 @@ impl Future[Result[(), NetworkError]] for NetworkWriteFuture {
             }
         }
     }
+}
+
+extern fn mfnet_scope_new(parent: usize, capacity: usize) -> usize
+extern fn mfnet_scope_lease(id: usize) -> usize
+extern fn mfnet_scope_closed(id: usize) -> bool
+extern fn mfnet_scope_close(id: usize) -> bool
+
+/// Internal ownership scope for protocol clients. Copies share one lifetime.
+pub struct __Group {
+    id: usize
+    ownership: __Lease
+}
+
+impl for __Group {
+    pub fn empty() -> Self {
+        ret Self { 0_usize, __empty() }
+    }
+    #attr(safe)
+    pub fn new(parent: usize, capacity: usize) -> Result[Self, NetworkError] {
+        unsafe {
+            let id = mfnet_scope_new(parent, capacity)
+            if id == 0_usize {
+                ret Result::Err(NetworkError {
+                        ErrorKind::Capacity, "operation group capacity exhausted"
+                    }
+                )
+            }
+            let lease = mfnet_scope_lease(id)
+            if lease == 0_usize {
+                ret Result::Err(NetworkError {
+                        ErrorKind::Capacity, "cannot own operation group"
+                    }
+                )
+            }
+            ret Result::Ok(Self { id, __adopt(lease) })
+        }
+    }
+    #attr(safe)
+    pub fn closed(self: Self) -> bool {
+        unsafe {
+            ret mfnet_scope_closed(self.id)
+        }
+    }
+    #attr(safe)
+    pub fn close(self: Self) -> bool {
+        unsafe {
+            ret mfnet_scope_close(self.id)
+        }
+    }
+}
+
+#cfg(linux)
+fn default_ca_file() -> str {
+    ret ""
+}
+#cfg(not(linux))
+fn default_ca_file() -> str {
+    if env("SSL_CERT_FILE").is_some() || env("SSL_CERT_DIR").is_some() {
+        ret ""
+    }
+    let root = Path::new(core_dir()).parent().unwrap_or(Path::new(".")).join("openssl")
+    for target in vec!["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-w64-windows-gnu", "aarch64-w64-windows-gnu"] {
+        let bundle = root.join(target).join("cert.pem")
+        if file_exists(bundle.as_str()) {
+            ret bundle.as_str()
+        }
+    }
+    ret ""
 }

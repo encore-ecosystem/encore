@@ -3,6 +3,17 @@
 #include <assert.h>
 // Refusal on Windows IPv6 loopback can take two seconds before IPv4 is tried.
 enum { TEST_CONNECTION_TIMEOUT_MS = 5000 };
+typedef struct { size_t payload; void (*dropper)(size_t); } test_lease;
+size_t encore_sync_box_new(size_t payload, size_t dropper) {
+    test_lease *lease=malloc(sizeof(*lease));
+    if(!lease) return 0;
+    lease->payload=payload; lease->dropper=(void (*)(size_t))(uintptr_t)dropper;
+    return (size_t)(uintptr_t)lease;
+}
+static void release_lease(size_t raw) {
+    test_lease *lease=(void *)(uintptr_t)raw;
+    lease->dropper(lease->payload); free(lease);
+}
 static void (*cleanup_hook)(size_t);
 static size_t wake_count;
 bool encore_async_register_waker_cleanup(void (*hook)(size_t)) { cleanup_hook=hook; return true; }
@@ -89,6 +100,21 @@ static void test_groups(void) {
     pthread_mutex_lock(&mu);endpoint *ep=find_ep(client);assert(!ep || ep->closed);pthread_mutex_unlock(&mu);
     mfnet_close(peer);mfnet_close(server);mfnet_close(group);
 }
+static void test_owned_operations(void) {
+    size_t group=mfnet_scope_new(0,1), group_lease=mfnet_scope_lease(group);
+    size_t child=mfnet_scope_new(group,1), child_lease=mfnet_scope_lease(child);
+    assert(group_lease && child_lease && !mfnet_scope_new(group,1));
+    size_t op=io(5,0,"",0,100), lease=mfnet_operation_lease(op);
+    assert(lease && mfnet_status(op,42)==0);
+    cleanup_hook(42);
+    assert(wait_for(op)==1); mfnet_release(op); release_lease(lease);
+    release_lease(child_lease);
+    assert(mfnet_scope_closed(child));
+    child=mfnet_scope_new(group,1); assert(child);
+    child_lease=mfnet_scope_lease(child);
+    assert(mfnet_scope_close(group)); assert(mfnet_scope_closed(child));
+    release_lease(child_lease); release_lease(group_lease);
+}
 static void test_bad_certificate(const char *cert,const char *key) {
     size_t server=listener(true,cert,key),port=mfnet_port(server);size_t accept=io(4,server,"",0,2000);
     size_t op=endpoint_op(1,"127.0.0.1",port,true,cert,"","");assert(wait_for(op)==7);mfnet_release(op);
@@ -133,7 +159,7 @@ static void test_pipe(void) {
 int main(int argc,char **argv) {
     test_pipe();
 
-    assert(argc==3); roundtrip(false,"","");roundtrip(true,argv[1],argv[2]);test_listener_survives_timeout();test_mailbox();test_groups();test_bad_certificate(argv[1],argv[2]);
+    assert(argc==3); roundtrip(false,"","");roundtrip(true,argv[1],argv[2]);test_listener_survives_timeout();test_mailbox();test_groups();test_owned_operations();test_bad_certificate(argv[1],argv[2]);
     for(int i=0;i<100;i++) { pause_ms(5);pthread_mutex_lock(&mu);bool empty=endpoints==NULL&&operation_count==0;pthread_mutex_unlock(&mu);if(empty) { puts("native TCP/TLS, IPC, timeout, cancellation, queue, certificate and lifetime tests passed");return 0; } }
     assert(!"native resource leak");return 1;
 }

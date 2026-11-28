@@ -23,8 +23,7 @@ fi
   libc6-dev-arm64-cross \
   linux-libc-dev-arm64-cross \
   libgcc-13-dev-arm64-cross \
-  libssl-dev:arm64 \
-  libc-ares-dev:arm64
+  libssl-dev:arm64
 
 mkdir -p \
   "$output" \
@@ -53,4 +52,3 @@ find "$output/usr/lib/gcc/aarch64-linux-gnu" -mindepth 2 -maxdepth 2 \
   -name crtbeginS.o -type f | grep -q .
 test -e "$output/usr/lib/aarch64-linux-gnu/libssl.so"
 test -e "$output/usr/lib/aarch64-linux-gnu/libcrypto.so"
-test -e "$output/usr/lib/aarch64-linux-gnu/libcares.so"

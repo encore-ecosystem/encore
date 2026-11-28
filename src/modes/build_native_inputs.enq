@@ -19,10 +19,11 @@ import refrain::cache_identity::compiler_content_digest
 /// are exactly those used for compilation; no handwritten recursive scanner.
 pub fn native_source_identity(source: Path, plan: UnitNativePlan, directory: Path,
     ordinal: usize,) -> Result[str, str] {
+    let identity = native_flags_identity(source, plan)?
     let child = start_native_scan(source, plan, directory, ordinal)?
     let stem = "headers-" + Debug::fmt(ordinal)
     finish_unit_tool(child, plan.compiler, directory, stem)?
-    ret native_scan_identity(plan.identity()?, directory, ordinal)
+    ret native_scan_identity(identity, directory, ordinal)
 }
 
 /// The package phase is already reaped. This phase has at most `jobs` guarded
@@ -32,7 +33,11 @@ pub fn native_source_identities(sources: Vec[Path], plan: UnitNativePlan, direct
     if jobs == 0 {
         ret Result[Vec[str], str]::Err("native scan needs a CPU budget")
     }
-    let native_identity = plan.identity()?
+    // Validate every tool/flag identity before starting supervised children.
+    let mut identities = Vec[str]::new()
+    for source in sources {
+        identities.push(native_flags_identity(source, plan)?)
+    }
     let mut results = Vec[str]::new()
     let mut offset = 0_usize
     while offset < sources.len() {
@@ -62,7 +67,7 @@ pub fn native_source_identities(sources: Vec[Path], plan: UnitNativePlan, direct
             if failure == "" {
                 match finish_unit_tool(child, plan.compiler, directory, "headers-" + Debug::fmt(index)) {
                     Ok(_) => {
-                        match native_scan_identity(native_identity, directory, index) {
+                        match native_scan_identity(identities.get(index).unwrap_or(""), directory, index) {
                             Ok(identity) => {
                                 results.push(identity)
                             }
@@ -91,10 +96,7 @@ fn start_native_scan(source: Path, plan: UnitNativePlan, directory: Path,
     ordinal: usize,) -> Result[usize, str] {
     let stem = "headers-" + Debug::fmt(ordinal)
     let dependency_file = directory.join(stem + ".d")
-    let mut args = Vec[str]::new()
-    for argument in plan.args {
-        args.push(argument)
-    }
+    let mut args = native_source_args(plan.args, source)
     args.push("-M") args.push("-MT") args.push("encore") args.push("-MF") args.push(dependency_file.as_str())
     args.push(source.as_str())
     ret start_program_tool(plan.compiler, args, directory, stem)
@@ -254,4 +256,48 @@ fn metadata_native_dependencies_literal_backslashes_contract() -> bool {
     }
     ret paths.len() == 3 && paths.get(0).unwrap_or("") == "dir\\ with space.h" &&
     paths.get(1).unwrap_or("") == "hash#name.h" && paths.get(2).unwrap_or("") == "dir\\\\header.h"
+}
+
+/// Keep the compiler's content hashing optimized without optimizing user code.
+/// Flags are shared by dependency scanning and actual C compilation.
+pub fn native_source_args(base: Vec[str], source: Path) -> Vec[str] {
+    let mut args = Vec[str]::new()
+    for argument in base {
+        args.push(argument)
+    }
+    if source.file_name().unwrap_or("") == "runtime.hash.c" {
+        args.push("-O2")
+    } elif source.file_name().unwrap_or("") == "runtime.c" &&
+    file_exists(source.parent().unwrap_or(source).join("runtime.hash.c").as_str()) {
+        args.push("-DENCORE_SEPARATE_HASH_RUNTIME")
+    }
+    ret args
+}
+fn native_flags_identity(source: Path, plan: UnitNativePlan) -> Result[str, str] {
+    ret UnitNativePlan { plan.compiler, plan.archiver, native_source_args(plan.args, source) }.identity()
+}
+pub fn native_companion_sources(sources: Vec[Path]) -> Vec[Path] {
+    let mut out = Vec[Path]::new()
+    for source in sources {
+        out.push(source)
+    }
+    for source in sources {
+        if source.file_name().unwrap_or("") != "runtime.c" {
+            continue
+        }
+        let hash = source.parent().unwrap_or(source).join("runtime.hash.c")
+        if !file_exists(hash.as_str()) {
+            continue
+        }
+        let mut present = false
+        for previous in out {
+            if previous.as_str() == hash.as_str() {
+                present = true
+            }
+        }
+        if !present {
+            out.push(hash)
+        }
+    }
+    ret out
 }

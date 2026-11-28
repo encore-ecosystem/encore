@@ -1,0 +1,402 @@
+//! Bounded HTTP futures over network's shared TCP/TLS reactor.
+import core::future::{Context, Future, Poll}
+import core::ops::ContextManager
+import core::option::Option
+import core::panic::panic
+import core::result::Result
+
+import std::sync::{Mutex, MutexGuard}
+import std::sync::__ownership::{__Lease, __empty}
+import std::sync::cancellation::CancellationToken
+import std::time::perf_counter_ms
+
+import http::codec::{Decoder, response}
+import http::errors::{HTTPError, HTTPErrorKind}
+import http::types::{HttpClientConfig, HttpRequest, HttpResponse, Url}
+import network::{ErrorKind, NetworkError, OperationFuture, __Group}
+
+pub struct HTTPCancellationToken {
+    client: usize
+    token: CancellationToken
+}
+
+impl for HTTPCancellationToken {
+    pub fn cancel(self: Self) ->() {
+        self.token.cancel()
+    }
+}
+
+/// Copies share a logical client. Closing it only cancels its own requests.
+pub struct HTTPAsyncClient {
+    group: __Group
+    config: HttpClientConfig
+}
+
+impl for HTTPAsyncClient {
+    pub fn new() -> Result[Self, HTTPError] {
+        ret Self::with_capacity(32_usize)
+    }
+    pub fn with_capacity(capacity: usize) -> Result[Self, HTTPError] {
+        if capacity == 0_usize || capacity > 32_usize {
+            ret Result::Err(HTTPError { HTTPErrorKind::Configuration, "invalid HTTP capacity" })
+        }
+        match __Group::new(0_usize, capacity) {
+            Result::Ok(group) => {
+                ret Result::Ok(Self { group, HttpClientConfig::default() })
+            }
+            Result::Err(error) => {
+                ret Result::Err(network_error(error))
+            }
+        }
+    }
+    pub fn with_config(self: Self, config: HttpClientConfig) -> Self {
+        ret Self {
+            self.group, config
+        }
+    }
+    pub fn cancellation_token(self: Self) -> HTTPCancellationToken {
+        ret HTTPCancellationToken { self.group.id, CancellationToken::new() }
+    }
+    pub fn send(self: Self, request: HttpRequest) -> HTTPResponseFuture {
+        let wire = request.encode()
+        let failure = match request.validate() {
+            Result::Ok(_) => Option[HTTPError]::None
+            Result::Err(message) => Option[HTTPError]::Some(HTTPError {
+                    HTTPErrorKind::Configuration, message
+                }
+            )
+        }
+        ret HTTPResponseFuture {
+            Mutex[RequestState]::new(RequestState {
+                    self, request.url, failure, __Group::empty(),
+                    Option[OperationFuture]::None, 0_usize, 0_u8, 0_u64, wire, request.body_value.byte_len(), 0_usize,
+                    Decoder::new(self.config.max_body_size, self.config.max_header_size, request.method == "HEAD"),
+                    Option[HTTPCancellationToken]::None, Option[CancellationToken]::None, __empty(), __empty()
+                }
+            )
+        }
+    }
+    pub fn get(self: Self, value: str) -> HTTPResponseFuture {
+        match Url::parse(value) {
+            Result::Ok(url) => {
+                ret self.send(HttpRequest::get(url))
+            }
+            Result::Err(message) => {
+                ret self.send(HttpRequest::get(Url::empty())).__with_failure(HTTPError {
+                        HTTPErrorKind::Configuration, message
+                    }
+                )
+            }
+        }
+    }
+    pub fn close(self: Self) -> bool {
+        ret self.group.close()
+    }
+}
+
+impl ContextManager for HTTPAsyncClient {
+    pub fn with_enter(self: Self) -> Self {
+        ret self
+    }
+    pub fn with_exit(self: Self) -> bool {
+        ret self.close()
+    }
+}
+
+pub struct HTTPResponseFuture {
+    storage: Mutex[RequestState]
+}
+
+impl for HTTPResponseFuture {
+    fn lock(self: Self) -> MutexGuard[RequestState] {
+        match self.storage.try_lock() {
+            Result::Ok(guard) => {
+                ret guard
+            }
+            Result::Err(_) => {
+                panic("HTTP future must have a single consumer") loop {
+                }
+            }
+        }
+    }
+    pub fn __with_failure(self: Self, error: HTTPError) -> Self {
+        let guard = self.lock()
+        let mut state = take_state(guard)
+        state.failure = Option[HTTPError]::Some(error)
+        let _previous = guard.replace(state)
+        guard.release()
+        ret self
+    }
+    pub fn with_cancellation(self: Self, token: HTTPCancellationToken) -> Self {
+        let guard = self.lock()
+        let mut state = take_state(guard)
+        state.http_token = Option[HTTPCancellationToken]::Some(token)
+        let _previous = guard.replace(state)
+        guard.release()
+        ret self
+    }
+    pub fn with_token(self: Self, token: CancellationToken) -> Self {
+        let guard = self.lock()
+        let mut state = take_state(guard)
+        state.token = Option[CancellationToken]::Some(token)
+        let _previous = guard.replace(state)
+        guard.release()
+        ret self
+    }
+}
+fn take_state(guard: MutexGuard[RequestState]) -> sending RequestState {
+    match guard.take() {
+        Result::Ok(value) => {
+            match value {
+                Option::Some(state) => {
+                    ret state
+                }
+                Option::None => {
+                }
+            }
+        }
+        Result::Err(_) => {
+        }
+    }
+    panic("HTTP future already completed") loop {
+    }
+}
+
+impl Future[Result[HttpResponse, HTTPError]] for HTTPResponseFuture {
+    pub fn poll(self: Self, context: Context) -> Poll[Self, Result[HttpResponse, HTTPError]] {
+        let guard = self.lock()
+        let mut state = take_state(guard)
+        let result = state.step(context)
+        match result {
+            Result::Ok(value) => {
+                match value {
+                    Option::Some(response) => {
+                        let _closed = state.group.close()
+                        guard.release()
+                        ret Poll::Ready(Result::Ok(response))
+                    }
+                    Option::None => {
+                        let _previous = guard.replace(state)
+                        guard.release()
+                        ret Poll::Pending(self)
+                    }
+                }
+            }
+            Result::Err(error) => {
+                let _closed = state.group.close()
+                guard.release()
+                ret Poll::Ready(Result::Err(error))
+            }
+        }
+    }
+}
+struct RequestState {
+    client: HTTPAsyncClient
+    url: Url
+    failure: Option[HTTPError]
+    group: __Group
+    operation: Option[OperationFuture]
+    stream: usize
+    stage: u8
+    started: u64
+    wire: str
+    body_size: usize
+    offset: usize
+    decoder: Decoder
+    http_token: Option[HTTPCancellationToken]
+    token: Option[CancellationToken]
+    registration: __Lease
+    http_registration: __Lease
+}
+
+impl for RequestState {
+    fn finish(self: Self, error: HTTPError) -> Result[Option[HttpResponse], HTTPError] {
+        ret Result::Err(error)
+    }
+    fn prepare(self: mut Self) -> Result[(), HTTPError] {
+        match self.failure {
+            Option::Some(error) => {
+                ret Result::Err(error)
+            }
+            Option::None => {
+            }
+        }
+        let config = self.client.config
+        if config.timeout_ms == 0_usize || config.timeout_ms > 86400000_usize || config.connect_timeout_ms == 0_usize
+        || config.connect_timeout_ms > 86400000_usize || config.max_body_size > 1073741824_usize
+        || config.max_header_size < 16_usize || config.max_header_size > 1048576_usize {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Configuration, "invalid HTTP limits or timeout"
+                }
+            )
+        }
+        match self.http_token {
+            Option::Some(token) => {
+                if token.client != self.client.group.id {
+                    ret Result::Err(HTTPError {
+                            HTTPErrorKind::Configuration, "cancellation token belongs to another client"
+                        }
+                    )
+                }
+            }
+            Option::None => {
+            }
+        }
+        if self.wire.byte_len() - self.body_size > config.max_header_size || self.body_size > config.max_body_size {
+            ret Result::Err(HTTPError {
+                    HTTPErrorKind::Limit, "HTTP request exceeds configured limit"
+                }
+            )
+        }
+        self.group = match __Group::new(self.client.group.id, 1_usize) {
+            Result::Ok(group) => group
+            Result::Err(error) => {
+                ret Result::Err(network_error(error))
+            }
+        }
+        self.started = perf_counter_ms()
+        let connect_ms = if config.connect_timeout_ms < config.timeout_ms {
+            config.connect_timeout_ms
+        } else {
+            config.timeout_ms
+        }
+        let url = self.url
+        self.operation = Option[OperationFuture]::Some(OperationFuture::endpoint(1_i32, url.host(), url.port(),
+                url.scheme() == "https", config.ca_file, "", "", connect_ms,).in_group(self.group.id))
+        ret Result::Ok(())
+    }
+    pub fn step(self: mut Self, context: Context) -> Result[Option[HttpResponse], HTTPError] {
+        if self.client.group.closed() {
+            ret self.finish(HTTPError { HTTPErrorKind::Closed, "HTTP client is closed" })
+        }
+        match self.token {
+            Option::Some(token) => {
+                if token.is_cancelled() {
+                    ret self.finish(HTTPError {
+                            HTTPErrorKind::Cancelled, "HTTP request cancelled"
+                        }
+                    )
+                }
+                self.registration = token.__register(context.waker).unwrap_or(__empty())
+            }
+            Option::None => {
+            }
+        }
+        match self.http_token {
+            Option::Some(token) => {
+                if token.client != self.client.group.id {
+                    ret self.finish(HTTPError {
+                            HTTPErrorKind::Configuration, "cancellation token belongs to another client"
+                        }
+                    )
+                }
+                if token.token.is_cancelled() {
+                    ret self.finish(HTTPError {
+                            HTTPErrorKind::Cancelled, "HTTP request cancelled"
+                        }
+                    )
+                }
+                self.http_registration = token.token.__register(context.waker).unwrap_or(__empty())
+            }
+            Option::None => {
+            }
+        }
+        if self.group.id == 0_usize {
+            match self.prepare() {
+                Result::Err(error) => {
+                    ret self.finish(error)
+                }
+                Result::Ok(_) => {
+                }
+            }
+        }
+        for _attempt in 0_usize..16_usize {
+            let elapsed = perf_counter_ms() - self.started
+            if elapsed >= self.client.config.timeout_ms as u64 {
+                ret self.finish(HTTPError {
+                        HTTPErrorKind::Timeout, "HTTP request deadline exceeded"
+                    }
+                )
+            }
+            let remaining = self.client.config.timeout_ms - elapsed as usize
+            if self.operation.is_none() {
+                let operation = if self.stage == 1_u8 {
+                    let left = self.wire.byte_len() - self.offset
+                    let size = if left < 16384_usize {
+                        left
+                    } else {
+                        16384_usize
+                    }
+                    OperationFuture::io(3_i32, self.stream, self.wire.slice_bytes(self.offset, size), 0_usize, remaining)
+                } else {
+                    OperationFuture::io(2_i32, self.stream, "", 16384_usize, remaining)
+                }
+                self.operation = Option[OperationFuture]::Some(operation.in_group(self.group.id))
+            }
+            let operation = match self.operation {
+                Option::Some(value) => value Option::None => {
+                    ret self.finish(HTTPError {
+                            HTTPErrorKind::Io, "missing HTTP operation"
+                        }
+                    )
+                }
+            }
+            let value = match operation.poll(context) {
+                Poll::Pending(next) => {
+                    self.operation = Option[OperationFuture]::Some(next)
+                    ret Result::Ok(Option[HttpResponse]::None)
+                }
+                Poll::Ready(result) => {
+                    self.operation = Option[OperationFuture]::None
+                    match result {
+                        Result::Ok(value) => value
+                        Result::Err(error) => {
+                            ret self.finish(network_error(error))
+                        }
+                    }
+                }
+            }
+            if self.stage == 0_u8 {
+                self.stream = value.handle
+                self.stage = 1_u8
+            } elif self.stage == 1_u8 {
+                let left = self.wire.byte_len() - self.offset
+                self.offset += if left < 16384_usize {
+                    left
+                } else {
+                    16384_usize
+                }
+                if self.offset == self.wire.byte_len() {
+                    self.stage = 2_u8
+                }
+            } else {
+                match self.decoder.feed(value.data, value.data.byte_len() == 0_usize) {
+                    Result::Err(error) => {
+                        ret self.finish(error)
+                    }
+                    Result::Ok(done) => {
+                        if done {
+                            let value = response(self.decoder.status, self.decoder.headers, self.decoder.body())
+                            let _closed = self.group.close()
+                            ret Result::Ok(Option[HttpResponse]::Some(value))
+                        }
+                    }
+                }
+            }
+        }
+        context.waker.wake()
+        ret Result::Ok(Option[HttpResponse]::None)
+    }
+}
+fn network_error(error: NetworkError) -> HTTPError {
+    let kind = match error.kind {
+        ErrorKind::Closed => HTTPErrorKind::Io
+        ErrorKind::Cancelled => HTTPErrorKind::Cancelled
+        ErrorKind::Timeout => HTTPErrorKind::Timeout
+        ErrorKind::Dns => HTTPErrorKind::Dns
+        ErrorKind::Connect => HTTPErrorKind::Connect
+        ErrorKind::Tls => HTTPErrorKind::Tls
+        ErrorKind::Capacity => HTTPErrorKind::Capacity
+    }
+    ret HTTPError { kind, error.message }
+}

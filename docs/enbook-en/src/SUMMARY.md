@@ -66,10 +66,10 @@
   - [`std::fmt`](library/std/fmt.md)
   - [`std::fs`](library/std/fs.md)
   - [`std::future`](library/std/future.md)
-  - [`std::http`](library/std/http.md)
+  - [`http`](library/std/http.md)
   - [`std::io`](library/std/io.md)
   - [`std::math`](library/std/math.md)
-  - [`std::net`](library/std/net.md)
+  - [`network` TCP](library/std/net.md)
   - [`std::num`](library/std/num.md)
   - [`std::ops`](library/std/ops.md)
   - [`std::option`](library/std/option.md)
@@ -85,7 +85,7 @@
   - [`std::task`](library/std/task.md)
   - [`std::thread`](library/std/thread.md)
   - [`std::time`](library/std/time.md)
-  - [`std::tls`](library/std/tls.md)
+  - [`network` TLS](library/std/tls.md)
   - [`std::vec`](library/std/vec.md)
 
 # Advanced Topics and Appendices

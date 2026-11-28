@@ -1,22 +1,22 @@
-# `std::http`
+# `http`
 
 Provides URL parsing, shared request and response values, blocking and
 nonblocking clients, TLS verification, and bounded response parsing.
 
 `HTTPSyncClient::new().get(url)` returns `Result[HttpResponse, HTTPError]`.
-`HTTPAsyncClient::new()` returns a result containing a client that owns its
+`HTTPAsyncClient::new()` returns a result containing a client with its own request group on the shared network
 reactor. Its `get` and `send` methods return `HTTPResponseFuture` for `await` or
 `std::future::block_on`; no HTTP-specific executor is needed. Use a with-context
-or explicitly close the async client. Copies share the reactor and close state.
+or explicitly close the async client. Copies share the client close state; other clients remain independent.
 
 Both clients accept `HttpClientConfig` and `HttpRequest`, return `HttpResponse`,
 and report typed `HTTPError` values. Requests do not follow redirects or retry
 automatically. The compatibility `HttpClient` retains its redirecting `get` and
 string errors.
 
-The async backend initially supports Linux with OpenSSL and c-ares >=1.34
-development packages. Other targets report an unsupported configuration when
-creating an async client. The sync client retains the platform TLS fallback.
+Add `sys@http` to dependencies. Sync and async clients run on Linux, macOS and
+Windows through `network` and its OpenSSL backend. TLS uses OpenSSL trust
+configuration, with `with_ca_file` for a custom CA.
 Plain HTTP is restricted to loopback addresses.
 
 ```encore

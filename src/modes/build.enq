@@ -26,7 +26,7 @@ import mod::build_cache::{UnitCacheLock, close_unit_cache_lock, try_unit_cache_l
 import mod::build_coordinator::{CompiledPackage, compile_cached_package_graph}
 import mod::build_ehir_artifacts::template_snapshot_key
 import mod::build_metadata::{MetadataContext, metadata_name_before}
-import mod::build_native_inputs::{native_source_identities, native_source_identity}
+import mod::build_native_inputs::{native_companion_sources, native_source_args, native_source_identities, native_source_identity}
 import mod::build_output::{append_package_archives, append_shared_library_args, build_artifact_label, build_artifact_name, build_import_library_name, merge_static_library}
 import mod::build_receipt::{BuildInputInventory, build_input_inventory, publish_successful_build, successful_build_matches, successful_build_miss_reason, watched_build_inputs}
 import mod::build_requirements::{UnitRequirements, requirements_content_digest}
@@ -479,6 +479,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
             }
         }
     }
+    native_sources = native_companion_sources(native_sources)
     if mkdir_all(native_path(object_dir.as_str())) != 0_i32 {
         progress.fail_stage("failed to create object directory")
         ret 1_u32
@@ -604,7 +605,7 @@ pub fn compile_project_with_profile(root: Path, requested: str) -> u32 {
                 file_exists(native_path(object_fingerprint_path.as_str())) &&
                 read_file(native_path(object_fingerprint_path.as_str())) == object_fingerprint
                 if !object_cached {
-                    let mut native_args = compiler_args(root, profile, target, toolchain)
+                    let mut native_args = native_source_args(compiler_args(root, profile, target, toolchain), source)
                     native_args.push("-c")
                     native_args.push(native_path(source.as_str()))
                     native_args.push("-o")
@@ -1041,7 +1042,7 @@ fn compile_package_binary_in(root: Path, target: TargetSpec, toolchain: Toolchai
     index = 0
     for source in sources {
         let object = staging.join("native-" + Debug::fmt(index) + ".o")
-        let mut args = compiler_args(root, profile, target, toolchain)
+        let mut args = native_source_args(compiler_args(root, profile, target, toolchain), source)
         args.push("-c") args.push(native_path(source.as_str())) args.push("-o") args.push(object.as_str())
         compile_cached_native_object(source, native, args, staging, profile_dir, object,
             native_keys.get(index).unwrap_or(""), index,)?
@@ -1652,7 +1653,7 @@ fn package_native_sources(root: Path, graph: ResolvedPackageGraph, target: Targe
             }
         }
     }
-    ret sources
+    ret native_companion_sources(sources)
 }
 
 fn resolve_native_program(program: str) -> Result[str, str] {
@@ -2117,7 +2118,7 @@ fn fingerprint_native_file(current: str, path: Path) -> str {
 }
 
 fn native_object_fingerprint(root: Path, source: Path, target: TargetSpec, toolchain: Toolchain, profile: str) -> str {
-    let mut value = "encore-native-object-v2\n" + target.triple + "\n" + profile
+    let mut value = "encore-native-object-v3\n" + target.triple + "\n" + profile
     value = fingerprint_mix(value, toolchain.compiler)
     value = fingerprint_mix(value, toolchain.sysroot)
     value = fingerprint_mix(value, toolchain.cpu)
@@ -2125,7 +2126,7 @@ fn native_object_fingerprint(root: Path, source: Path, target: TargetSpec, toolc
     for arg in toolchain.compile_args {
         value = fingerprint_mix(value, arg)
     }
-    for arg in compiler_args(root, profile, target, toolchain) {
+    for arg in native_source_args(compiler_args(root, profile, target, toolchain), source) {
         value = fingerprint_mix(value, arg)
     }
     value = fingerprint_native_file(value, source)
@@ -3921,24 +3922,6 @@ fn append_profile_link_args(args: mut Vec[str], profile: str, target: TargetSpec
     if target.os == "linux" || target.os == "windows" {
         args.push("-fuse-ld=lld")
     }
-    append_tls_link_args(args, target)
-    ret()
-}
-
-fn append_tls_link_args(args: mut Vec[str], target: TargetSpec) ->() {
-    if target.os == "linux" {
-        args.push("-lssl") args.push("-lcrypto") args.push("-lcares")
-    } elif target.os == "macos" {
-        args.push("-framework") args.push("Security") args.push("-framework") args.push("CoreFoundation")
-        args.push("-framework") args.push("Network")
-    } elif target.os == "windows" {
-        // platform/runtime.c uses Winsock, SChannel/SSPI and CryptoAPI.
-        // Spell these out for both Clang GNU cross kits and native Clang/MSVC
-        // drivers instead of relying on an environment's implicit defaults.
-        args.push("-lws2_32")
-        args.push("-lsecur32")
-        args.push("-lcrypt32")
-    }
     ret()
 }
 
@@ -4393,7 +4376,6 @@ fn compile_entry_ast_in(root: Path, workspace: ProjectWorkspace, ast: Vec[Statem
         }
     }
     args.extend(native_metadata.link_arguments(target))
-    append_tls_link_args(args, host_target())
     args.push("-o")
     args.push(native_path(binary_path.as_str()))
     // Respect the resolved host toolchain. This is essential for packaged

@@ -11,7 +11,7 @@ shift 2
 needs_path_bridge=false
 case "$seed_tag" in
   v0.1.[0-5]-neumann) needs_path_bridge=true ;;
-  v0.1.[6-9]-neumann|v0.1.1[0-3]-neumann|v0.1.15-neumann) ;;
+  v0.1.[6-9]-neumann|v0.1.1[0-3]-neumann|v0.1.15-neumann|v0.1.16-neumann|v0.1.17-neumann) ;;
   *) exec "$seed" "$@" ;;
 esac
 if [[ ! -f packages/core/src/reflect/mod.enq ]]; then
@@ -109,6 +109,24 @@ if [[ -f "$repository/packages/core/runtime_codec.h" ]] &&
   cp "$repository/packages/core/runtime_codec.h" "$source_root/packages/core/runtime_codec.h"
   printf '\n#include "runtime_codec.h"\n' >> "$source_root/packages/core/runtime.c"
 fi
+# Stage1 uses the seed SDK's HTTP API; later stages compile the new standalone
+# package against the current SDK. Do not pull new ownership types into old SDKs.
+python3 - "$source_root" <<'PYTHON'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+for path in (root / "src").rglob("*.enq"):
+    source = path.read_text()
+    path.write_text(source.replace("import http::", "import std::http::"))
+manifest = root / "encore.toml"
+source = manifest.read_text()
+for reference in (' "path@packages/network",', ' "path@packages/http",'):
+    source = source.replace(reference, '')
+manifest.write_text(source)
+credential_manifest = root / "packages/secret-store/encore.toml"
+source = credential_manifest.read_text().replace('build = "build.enq"\n', '').replace('dependencies = ["sys@std"]', 'dependencies = []')
+credential_manifest.write_text(source)
+PYTHON
 core_root="$source_root/packages/core"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) core_root=$(cygpath -m "$core_root") ;;

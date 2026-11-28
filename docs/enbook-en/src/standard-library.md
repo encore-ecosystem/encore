@@ -158,14 +158,10 @@ for checked arithmetic. See [`std::time`](library/std/time.md).
 
 ## Networking
 
-`std::net` provides a synchronous TCP beta API:
-
-- `socket_addr(host, port)`
-- `TcpStream::connect`, `read`, `write`, `close`
-- `TcpListener::bind`, `accept`, `close`
-
-Network operations return `Result[..., str]` where the `Err` variant contains
-the native error string.
+TCP/TLS and HTTP live in separate SDK packages. Add `sys@network` for
+`network::{Stream, Listener, ConnectOptions, ListenOptions}`, and `sys@http` for
+`http::{HttpClient, HTTPSyncClient, HTTPAsyncClient}`. The former `std::net`,
+`std::tls` and `std::http` imports have been removed.
 
 ## Math And Random
 

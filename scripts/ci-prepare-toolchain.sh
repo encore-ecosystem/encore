@@ -6,12 +6,15 @@ triple=${1:-}
 if [[ "$triple" == *-apple-darwin ]]; then
   # Use the current runner image without raising the released binary's minimum
   # macOS version. Native C probes, compiler stages and LSP inherit this target.
+  if ! brew list openssl@3 >/dev/null 2>&1; then brew install openssl@3; fi
+  if [[ -z "${OPENSSL_DIR:-}" ]]; then printf 'OPENSSL_DIR=%s\n' "$(brew --prefix openssl@3)" >> "${GITHUB_ENV:?GITHUB_ENV is required}"; fi
+  printf '%s/bin\n' "$(brew --prefix openssl@3)" >> "${GITHUB_PATH:?GITHUB_PATH is required}"
   export MACOSX_DEPLOYMENT_TARGET=15.0
   printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "$MACOSX_DEPLOYMENT_TARGET" >> "${GITHUB_ENV:?GITHUB_ENV is required}"
 fi
 if [[ "$triple" == *-linux-gnu ]]; then
   sudo apt-get update
-  sudo apt-get install -y libssl-dev libc-ares-dev lld
+  sudo apt-get install -y libssl-dev lld
 fi
 if [[ "$triple" == *-w64-windows-gnu ]]; then
   version=20260616

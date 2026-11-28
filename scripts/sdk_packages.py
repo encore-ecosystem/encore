@@ -18,11 +18,11 @@ PACKAGES = (
     "core", "platform", "std", "rich", "serialize", "json", "binary", "log",
     "profile", "ehir-core", "ehir", "ehir-llvm-backend", "toml",
     "llvm", "argparse", "secret-store",
-    "network", "ipc", "asyncio", "ehir-interpret", "ehir-dbg",
+    "network", "http", "ipc", "asyncio", "ehir-interpret", "ehir-dbg",
 )
 EHIR_TOOLS = frozenset(("ehir-interpret", "ehir-dbg"))
 BYTECODE_PACKAGES = frozenset(("ehir", "ehir-core", "ehir-llvm-backend")) | EHIR_TOOLS
-IN_TREE_PACKAGES = frozenset(("network", "ipc", "asyncio")) | EHIR_TOOLS
+IN_TREE_PACKAGES = frozenset(("network", "http", "ipc", "asyncio")) | EHIR_TOOLS
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -133,7 +133,7 @@ def sdk_manifest(root: Path, ref: str = "HEAD", verify_checkout: bool = False,
     urls = module_urls(root, ref)
     version = tomllib.loads(git(root, "show", f"{ref}:encore.toml").decode("utf-8"))["project"]["version"]
     if tuple(map(int, version.split("."))) < (0, 1, 18):
-        packages = tuple(folder for folder in packages if folder not in EHIR_TOOLS)
+        packages = tuple(folder for folder in packages if folder not in EHIR_TOOLS and folder != "http")
     rows = []
     for folder in packages:
         path = package_path(root, ref, folder)
